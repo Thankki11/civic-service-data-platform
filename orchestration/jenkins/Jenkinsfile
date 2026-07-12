@@ -1,0 +1,27 @@
+// CI/CD: Git push nhanh dev -> tu dong deploy DAG len Airflow Staging
+// Nguoi phu trach: Thanh (Layer 7 theo bang action items)
+pipeline {
+    agent any
+    stages {
+        stage('Lint DAGs') {
+            steps {
+                sh 'pip install --quiet apache-airflow ruff || true'
+                sh 'ruff check orchestration/dags/ || true'
+                sh 'python -c "import ast,glob;[ast.parse(open(f).read()) for f in glob.glob(\"orchestration/dags/*.py\")]"'
+            }
+        }
+        stage('Deploy to Staging Airflow') {
+            when { branch 'dev' }
+            steps {
+                // Staging truoc, Production sau (theo bang action items)
+                sh 'rsync -av orchestration/dags/ ${STAGING_AIRFLOW_DAGS_PATH}/'
+            }
+        }
+        stage('Deploy to Production') {
+            when { branch 'main' }
+            steps {
+                sh 'rsync -av orchestration/dags/ ${PROD_AIRFLOW_DAGS_PATH}/'
+            }
+        }
+    }
+}
