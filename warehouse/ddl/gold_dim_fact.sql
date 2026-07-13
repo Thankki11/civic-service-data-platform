@@ -12,38 +12,31 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_thoi_gian (
     thang         INT,
     quy           INT,
     nam           INT,
-    is_weekend    BOOLEAN,
-    is_holiday    BOOLEAN
+    co_phai_la_ngay_nghi    BOOLEAN
 ) USING iceberg;
 
 CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_co_quan (
-    id            INT,
-    ma_co_quan    STRING,
-    ten_co_quan   STRING,
-    cap_co_quan   STRING,
-    ma_phuong     STRING,
-    ten_phuong    STRING,
-    ma_quan       STRING,
-    ten_quan      STRING,
-    ma_tinh       STRING,
-    ten_tinh      STRING
+    co_quan_id            INT,
+    ten    STRING,
+    tinh   STRING,
+    phuong   STRING
 ) USING iceberg;
 
 CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_trang_thai (
-    id            INT,
+    trang_thai_id INT,
     ma_trang_thai STRING,
     ten_trang_thai STRING
 ) USING iceberg;
 
 CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_can_bo (
-    id            INT,
-    name          STRING,
-    role          STRING
+    can_bo_id INT,
+    ten STRING,
+    vi_tri STRING
 ) USING iceberg;
 
 CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_dich_vu_cong (
-    id              INT,
-    name            STRING,
+    dv_cong_id INT,
+    ten STRING,
     thoi_han_tra_kq INT
 ) USING iceberg;
 
@@ -54,7 +47,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_dich_vu_cong (
 -- Fact 1: Ghi nhan thoi gian xu ly cua tung hanh dong (Transactional)
 CREATE TABLE IF NOT EXISTS lakehouse.gold.fact_xu_ly_ho_so (
     id              BIGINT,
-    ho_so_id        INT,
+    ho_so_id        BIGINT,
     trang_thai_id   INT,
     can_bo_id       INT,
     dv_cong_id      INT,
@@ -67,7 +60,7 @@ PARTITIONED BY (thoi_gian_id);
 -- Fact 2: Chup nhanh tinh trang ho so ton dong cuoi ngay (Snapshot)
 CREATE TABLE IF NOT EXISTS lakehouse.gold.fact_ton_dong_ho_so (
     id                        BIGINT,
-    ho_so_id                  INT,
+    ho_so_id                  BIGINT,
     trang_thai_id             INT,
     can_bo_id                 INT,
     dv_cong_id                INT,
@@ -87,7 +80,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.fact_van_hanh_co_quan (
     so_luong_tre_han    INT COMMENT 'Tong xu ly tre han trong ngay',
     so_luong_rework     INT COMMENT 'Tong so ho so bi tra lai/yeu cau bo sung',
     so_luong_ton_dong   INT COMMENT 'Tong ton dong cuoi ngay',
-    tong_chi_phi        DECIMAL(18, 2) COMMENT 'Tong doanh thu phi/le phi',
+    tong_chi_phi        BIGINT COMMENT 'Tong doanh thu phi/le phi',
     thoi_gian_id        INT COMMENT 'Partition key (yyyymmdd)'
 ) USING iceberg
 PARTITIONED BY (thoi_gian_id);
