@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_dich_vu_cong (
 CREATE TABLE IF NOT EXISTS lakehouse.gold.fact_xu_ly_ho_so (
     id              BIGINT,
     ho_so_id        BIGINT,
+    co_quan_id      INT,
     trang_thai_id   INT,
     can_bo_id       INT,
     dv_cong_id      INT,
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.fact_ton_dong_ho_so (
     id                        BIGINT,
     ho_so_id                  BIGINT,
     trang_thai_id             INT,
+    co_quan_id                INT,
     can_bo_id                 INT,
     dv_cong_id                INT,
     so_ngay_ton_dong_hien_tai INT COMMENT 'So ngay ngam tai trang thai hien tai',
