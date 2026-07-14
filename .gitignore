@@ -33,3 +33,7 @@ data/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Ingestion specific ignores
+mock_database_csv/
+raw/

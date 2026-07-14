@@ -1,7 +1,7 @@
 # =====================================================================
 # Data Lakehouse - Docker Compose skeleton
 # Stack: MinIO, Kafka, Debezium, NiFi, Spark, Hive Metastore,
-#        StarRocks, Trino, Superset, Airflow
+#        StarRocks, Trino, Superset, Airflow, source_db, mock-api, stream-simulator
 # Lưu ý: đây là KHUNG để cả nhóm điền chi tiết theo phần mình phụ trách.
 # Image không dùng Bitnami (đã bị gỡ khỏi Docker Hub) — dùng image chính chủ.
 # =====================================================================
@@ -51,11 +51,28 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
+  source_db:
+    container_name: source_db
+    image: postgres:11
+    hostname: source_db
+    command: ["postgres", "-c", "wal_level=logical"]
+    ports:
+      - '5433:5432'
+    environment:
+      POSTGRES_USER: source_db
+      POSTGRES_PASSWORD: source_db
+      POSTGRES_DB: source_db
+    volumes:
+      - source_db_data:/var/lib/postgresql/data
+
   debezium:
     image: debezium/connect:2.7
-    depends_on: [kafka]
+    depends_on:
+      - kafka
+      - source_db
     ports:
       - "8083:8083"
+      - "8084:8083"
     environment:
       BOOTSTRAP_SERVERS: kafka:9092
       GROUP_ID: cdc-group
@@ -63,7 +80,7 @@ services:
       OFFSET_STORAGE_TOPIC: connect_offsets
       STATUS_STORAGE_TOPIC: connect_statuses
     # Đăng ký connector: POST file ingestion/debezium/register-connector.json
-    # vào http://localhost:8083/connectors
+    # vào http://localhost:8083/connectors hay http://localhost:8084/connectors
 
   nifi:
     image: apache/nifi:1.27.0
@@ -79,7 +96,10 @@ services:
 
   # ---------- COMPUTE (Layer 3/4) — Kiên + Quân ----------
   spark-master:
-    image: apache/spark:3.5.1
+    build:
+      context: .
+      dockerfile: DockerFile
+    image: apache_spark:3.5.1
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     ports:
       - "8081:8080"   # Spark Master UI
@@ -87,12 +107,13 @@ services:
     environment:
       SPARK_NO_DAEMONIZE: "true"
     volumes:
+      - .:/opt/spark-data
       - ./ingestion/spark-batch:/opt/jobs/ingestion
       - ./transform:/opt/jobs/transform
       - ./jars:/opt/spark/extra-jars   # iceberg-spark-runtime, hadoop-aws, aws-sdk
 
   spark-worker:
-    image: apache/spark:3.5.1
+    image: apache_spark:3.5.1
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     depends_on: [spark-master]
     environment:
@@ -100,6 +121,7 @@ services:
       SPARK_WORKER_MEMORY: 2g          # executor memory tối thiểu ~471MB, để 2g cho an toàn
       SPARK_WORKER_CORES: 2
     volumes:
+      - .:/opt/spark-data
       - ./ingestion/spark-batch:/opt/jobs/ingestion
       - ./transform:/opt/jobs/transform
       - ./jars:/opt/spark/extra-jars
@@ -196,8 +218,37 @@ services:
       - jenkins-data:/var/jenkins_home
     # Pipeline: orchestration/jenkins/Jenkinsfile
 
+  # ---------- MOCK DATA GENERATORS (Ingestion Branch) ----------
+  mock-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: mock-api
+    ports:
+      - "5000:5000"
+    command: ["python", "mock_api_server.py"]
+    volumes:
+      - ./data-generator:/app
+
+  stream-simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: stream-simulator
+    command: ["python", "data_stream_simulator.py"]
+    volumes:
+      - ./data-generator:/app
+    environment:
+      - PYTHONIOENCODING=utf-8
+      - DB_HOST=source_db
+      - DB_PORT=5432
+    depends_on:
+      - source_db
+      - kafka
+
 volumes:
   minio-data:
   metastore-db-data:
   airflow-db-data:
   jenkins-data:
+  source_db_data:

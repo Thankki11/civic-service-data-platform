@@ -1,0 +1,251 @@
+import os
+import time
+import uuid
+import random
+import logging
+import psycopg2
+import concurrent.futures
+from faker import Faker
+from lxml import etree
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ================= CẤU HÌNH =================
+DB_CONFIG = {
+    'dbname': 'source_db',
+    'user': 'source_db',
+    'password': 'source_db',
+    'host': os.environ.get('DB_HOST', 'localhost'),
+    'port': int(os.environ.get('DB_PORT', 5433))
+}
+fake = Faker('vi_VN')
+known_ids = []  # Bộ nhớ đệm chứa các ID hồ sơ đã biết
+known_applicant_ids = [] # Bộ nhớ đệm chứa các ID công dân đã biết
+
+# ================= HELPER =================
+def sub_text(parent, tag, value, **attrs):
+    el = etree.SubElement(parent, tag, **attrs)
+    el.text = '' if value is None else str(value)
+    return el
+
+def generate_insert_payload(app_id):
+    """Sinh ngẫu nhiên 1 gói tin XML tạo mới (INSERT)"""
+    now_str = time.strftime('%Y-%m-%d %H:%M:%S')
+    root = etree.Element('packet')
+    
+    md = etree.SubElement(root, 'metadata')
+    sub_text(md, 'ma_goi_tin', f"PKG_{uuid.uuid4().hex[:8]}")
+    sub_text(md, 'ma_du_lieu', 'DL_HO_SO')
+    sub_text(md, 'loai_du_lieu', 'XML')
+    sub_text(md, 'ngay_cap_nhat', now_str)
+    sub_text(md, 'su_kien', 'INSERT')
+    sub_text(md, 'id_ban_ghi', app_id)
+    
+    du_lieu = etree.SubElement(root, 'du_lieu')
+    sub_text(du_lieu, 'name', f"Hồ sơ dịch vụ công - {fake.company()}")
+    sub_text(du_lieu, 'Applicantid', random.randint(1, 20000))
+    sub_text(du_lieu, 'Serviceid', random.choice([1, 2]))
+    sub_text(du_lieu, 'Agencyid', random.choice([1, 2, 3]))
+    sub_text(du_lieu, 'created_at', now_str)
+    sub_text(du_lieu, 'Statusid', 1) # RECEIVED
+    
+    arr = etree.SubElement(du_lieu, 'document_array')
+    for i in range(random.randint(1, 3)):
+        el = etree.SubElement(arr, 'document')
+        sub_text(el, 'id', f"DOC_{uuid.uuid4().hex[:6]}")
+        sub_text(el, 'name', f"Tai_lieu_{fake.uuid4()[:4]}.pdf")
+        sub_text(el, 'file_url', f"https://dvc.gov.vn/docs/{fake.uuid4()[:8]}.pdf")
+        sub_text(el, 'Document_Typeid', random.choice([1, 2, 3, 4]))
+        
+    hist_arr = etree.SubElement(du_lieu, 'application_history_array')
+    hel = etree.SubElement(hist_arr, 'application_history')
+    sub_text(hel, 'id', f"H_{uuid.uuid4().hex[:4]}")
+    sub_text(hel, 'Statusid2', 1)
+    sub_text(hel, 'Officerid', random.choice([101, 102, 103])) # Cán bộ 1 cửa
+    sub_text(hel, 'action_time', now_str)
+    
+    return etree.tostring(root, encoding='utf-8', xml_declaration=True).decode('utf-8')
+
+def generate_update_payload(app_id):
+    """Sinh ngẫu nhiên 1 gói tin XML cập nhật trạng thái (UPDATE)"""
+    now_str = time.strftime('%Y-%m-%d %H:%M:%S')
+    root = etree.Element('packet')
+    
+    md = etree.SubElement(root, 'metadata')
+    sub_text(md, 'ma_goi_tin', f"PKG_{uuid.uuid4().hex[:8]}")
+    sub_text(md, 'ngay_cap_nhat', now_str)
+    sub_text(md, 'su_kien', 'UPDATE')
+    sub_text(md, 'id_ban_ghi', app_id)
+    
+    new_status = random.randint(2, 7) # Từ ASSIGNED đến COMPLETED
+    du_lieu = etree.SubElement(root, 'du_lieu')
+    sub_text(du_lieu, 'Statusid', new_status)
+    
+    hist_arr = etree.SubElement(du_lieu, 'application_history_array')
+    hel = etree.SubElement(hist_arr, 'application_history')
+    sub_text(hel, 'id', f"H_{uuid.uuid4().hex[:4]}")
+    sub_text(hel, 'Statusid2', new_status)
+    # Lãnh đạo hoặc Chuyên viên
+    sub_text(hel, 'Officerid', random.choice([201, 202, 301, 302, 303, 304])) 
+    sub_text(hel, 'action_time', now_str)
+    
+    return etree.tostring(root, encoding='utf-8', xml_declaration=True).decode('utf-8')
+
+# ================= CORE ENGINE =================
+def fetch_initial_ids():
+    """Lấy danh sách ID đã có sẵn trong DB để thực hiện UPDATE ngẫu nhiên"""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        cur.execute('SELECT id FROM "Application" LIMIT 5000')
+        rows = cur.fetchall()
+        for r in rows:
+            known_ids.append(r[0])
+            
+        cur.execute('SELECT id FROM "Applicant" LIMIT 5000')
+        app_rows = cur.fetchall()
+        for r in app_rows:
+            known_applicant_ids.append(r[0])
+            
+        conn.close()
+        logging.info(f"Đã nạp {len(known_ids)} hồ sơ cũ vào bộ nhớ đệm.")
+    except Exception as e:
+        logging.warning("Không thể nạp hồ sơ cũ (DB rỗng hoặc lỗi kết nối). Bắt đầu với bộ nhớ trống.")
+
+def worker_fire_batch(batch_size):
+    """Worker Thread: Sinh dữ liệu on-the-fly và nã vào DB"""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        conn.autocommit = True
+        cursor = conn.cursor()
+        
+        for _ in range(batch_size):
+            is_insert = (random.random() < 0.3) or (len(known_ids) == 0)
+            
+            try:
+                # ========================================================
+                # 1. BẮN ĐẠN CHO APPLICATION_TRACKING
+                # ========================================================
+                if is_insert:
+                    app_id = f"HS_{random.randint(100000, 999999)}"
+                    name = f"Hồ sơ dịch vụ công - {fake.company()}"
+                    applicant_id = random.choice(known_applicant_ids) if known_applicant_ids else f"{random.randint(10000, 99999)}"
+                    status_id = 1
+                    service_id = random.choice([1, 2])
+                    agency_id = random.choice([1, 2, 3])
+                    
+                    cursor.execute("""
+                        INSERT INTO "Application" (id, name, "Applicantid", "Statusid", "Serviceid", "Agencyid", created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """, (app_id, name, applicant_id, status_id, service_id, agency_id))
+                    
+                    hist_id = f"H_{uuid.uuid4().hex[:8]}"
+                    officer_id = random.choice([101, 102, 103])
+                    cursor.execute("""
+                        INSERT INTO "Application_History" (id, "Applicationid", "Statusid", "Statusid2", "Officerid", action_time)
+                        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    """, (hist_id, app_id, 1, 1, officer_id))
+                    
+                    for i in range(random.randint(1, 3)):
+                        doc_id = f"DOC_{uuid.uuid4().hex[:8]}"
+                        doc_name = f"Tai_lieu_{fake.uuid4()[:4]}.pdf"
+                        file_url = f"https://dvc.gov.vn/docs/{fake.uuid4()[:8]}.pdf"
+                        doc_type_id = random.choice([1, 2, 3, 4])
+                        cursor.execute("""
+                            INSERT INTO "Document" (id, name, "Applicationid", file_url, "Document_Typeid")
+                            VALUES (%s, %s, %s, %s, %s)
+                        """, (doc_id, doc_name, app_id, file_url, doc_type_id))
+                    
+                    known_ids.append(app_id)
+                else:
+                    app_id = random.choice(known_ids)
+                    new_status = random.randint(2, 7)
+                    
+                    cursor.execute("""
+                        UPDATE "Application"
+                        SET "Statusid" = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                    """, (new_status, app_id))
+                    
+                    hist_id = f"H_{uuid.uuid4().hex[:8]}"
+                    officer_id = random.choice([201, 202, 301, 302, 303, 304])
+                    cursor.execute("""
+                        INSERT INTO "Application_History" (id, "Applicationid", "Statusid", "Statusid2", "Officerid", action_time)
+                        VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    """, (hist_id, app_id, 1, new_status, officer_id))
+
+                # ========================================================
+                # 2. BẮN ĐẠN CHO APPLICANT (Người nộp) - SCD/Streaming
+                # ========================================================
+                # Thỉnh thoảng (20% xác suất) có người đăng ký mới hoặc cập nhật thông tin
+                if random.random() < 0.2:
+                    is_applicant_insert = (random.random() < 0.7) or (len(known_applicant_ids) == 0)
+                    if is_applicant_insert:
+                        # Sinh công dân mới
+                        new_app_id = f"{random.randint(10000, 99999)}"
+                        name = fake.name()
+                        ident = fake.numerify(text='030#########')
+                        password = fake.password()
+                        email = fake.ascii_free_email()
+                        phone = fake.phone_number()
+                        prov_id = random.randint(1, 2)
+                        ward_id = random.randint(1, 100)
+                        
+                        cursor.execute("""
+                            INSERT INTO "Applicant" (id, identity_num, name,phone, email, password, "Provinceid", "Wardid", updated_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        """, (new_app_id, ident, name,phone, email, password, prov_id, ward_id))
+                        known_applicant_ids.append(new_app_id)
+                    else:
+                        # Công dân cập nhật SĐT hoặc Email
+                        update_app_id = random.choice(known_applicant_ids)
+                        new_phone = fake.phone_number()
+                        cursor.execute("""
+                            UPDATE "Applicant"
+                            SET phone = %s, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = %s
+                        """, (new_phone, update_app_id))
+                        
+            except Exception as e:
+                pass # Bỏ qua lỗi khóa chính (nếu có) để giữ tốc độ nã đạn
+    except Exception as e:
+        logging.error(f"Lỗi Thread DB: {e}")
+    finally:
+        if 'conn' in locals() and conn is not None:
+            conn.close()
+
+def simulate_auto_stream(speed_per_second):
+    logging.info(f"🚀 BẮT ĐẦU AUTO CDC STREAMING (IN-MEMORY) - Tốc độ: {speed_per_second} req/s")
+    
+    batch_size = speed_per_second
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        while True:
+            start_time = time.time()
+            
+            # Quăng batch cho thread chạy
+            executor.submit(worker_fire_batch, batch_size)
+            
+            logging.info(f"[*] Da tu sinh va na {batch_size} goi XML vao PostgreSQL")
+            
+            # Cân bằng tốc độ để đạt đúng req/s
+            elapsed = time.time() - start_time
+            sleep_time = 1.0 - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+if __name__ == "__main__":
+    print("="*60)
+    print(" IN-MEMORY AUTO CDC STREAMING SIMULATOR ")
+    print("="*60)
+    fetch_initial_ids()
+    try:
+        speed = int(input("Nhập tốc độ bắn (số sự kiện / giây) [Mặc định: 50]: ") or "50")
+    except (ValueError, EOFError):
+        speed = 50
+        
+    try:
+        simulate_auto_stream(speed)
+    except KeyboardInterrupt:
+        print("\n⏹️ Đã dừng chiến dịch Stress Test.")
