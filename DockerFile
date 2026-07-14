@@ -1,0 +1,25 @@
+FROM apache/spark:3.5.1
+USER root
+
+RUN curl -fsSL \
+  "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.5.2/iceberg-spark-runtime-3.5_2.12-1.5.2.jar" \
+  -o /opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.5.2.jar
+
+RUN curl -fsSL \
+  "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar" \
+  -o /opt/spark/jars/hadoop-aws-3.3.4.jar
+
+RUN curl -fsSL \
+  "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar" \
+  -o /opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar
+
+RUN curl -fsSL \
+  "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.6.0/postgresql-42.6.0.jar" \
+  -o /opt/spark/jars/postgresql-42.6.0.jar
+
+# Cài đặt thêm JupyterLab và PySpark
+RUN pip install jupyterlab pyspark==3.5.1
+
+# Khắc phục lỗi Permission Denied của JupyterLab
+RUN mkdir -p /home/spark && chown -R spark:spark /home/spark
+USER spark
