@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Cài đặt các thư viện hệ thống cần thiết cho psycopg2 và lxml
+RUN apt-get update && apt-get install -y \
+    libpq-dev gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy toàn bộ source code vào container
+COPY . .
+
+# Mặc định container này không chạy gì cả, command sẽ được override trong docker-compose.yml
+CMD ["tail", "-f", "/dev/null"]
