@@ -56,7 +56,7 @@ Các Job của Spark được thiết kế để nạp dữ liệu vào lớp **
 ### 4.1. Nạp Master Data (Job 1)
 Luồng này sử dụng JDBC để đọc dữ liệu danh mục từ PostgreSQL và ghi thẳng vào bảng Iceberg:
 ```bash
-/opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/spark-data/ingestion/jdbc-db/spark-batch/job1_master_data.py
+/opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/spark-data/ingestion/jdbc-db/job1_master_data.py
 ```
 
 ### 4.2. Nạp dữ liệu XML (Job 2)

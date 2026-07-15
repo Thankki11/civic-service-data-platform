@@ -9,6 +9,26 @@ import shutil
 from datetime import datetime, timedelta
 from lxml import etree
 from faker import Faker
+import boto3
+import io
+
+# Cấu hình MinIO
+MINIO_ENDPOINT = os.environ.get('MINIO_ENDPOINT', 'http://localhost:9002')
+MINIO_ACCESS_KEY = os.environ.get('MINIO_ACCESS_KEY', 'minio_access_key')
+MINIO_SECRET_KEY = os.environ.get('MINIO_SECRET_KEY', 'minio_secret_key')
+BUCKET_NAME = 'landing-zone'
+
+try:
+    s3_client = boto3.client('s3', endpoint_url=MINIO_ENDPOINT, aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY, region_name='us-east-1')
+    try:
+        # Tạo bucket nếu chưa có
+        s3_client.create_bucket(Bucket=BUCKET_NAME)
+    except Exception as create_err:
+        # Bỏ qua lỗi nếu bucket đã tồn tại
+        pass
+except Exception as e:
+    print(f"Lưu ý: Không thể kết nối MinIO tự động ({e}).")
+    s3_client = None
 
 fake = Faker('vi_VN')
 random.seed(7)
@@ -46,12 +66,26 @@ def build_metadata(root, ma_goi_tin, su_kien, id_ho_so, ngay_cap_nhat):
     return md
 
 def write_packet(scenario, ma_goi_tin, root_el, su_kien, id_ho_so, t, note=''):
-    folder = os.path.join(OUTPUT_DIR, scenario)
-    os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, f"{ma_goi_tin}.xml")
-    etree.ElementTree(root_el).write(path, encoding='utf-8', xml_declaration=True, pretty_print=True)
+    folder = f"{OUTPUT_DIR}/{scenario}"
+    file_name = f"{ma_goi_tin}.xml"
+    s3_path = f"{folder}/{file_name}"
+    
+    xml_data = etree.tostring(root_el, encoding='utf-8', xml_declaration=True, pretty_print=True)
+    
+    if s3_client:
+        try:
+            s3_client.put_object(Bucket=BUCKET_NAME, Key=s3_path, Body=xml_data, ContentType='application/xml')
+        except Exception as e:
+            print(f"Lỗi đẩy lên MinIO: {e}")
+    else:
+        # Fallback local
+        local_folder = os.path.join(OUTPUT_DIR, scenario)
+        os.makedirs(local_folder, exist_ok=True)
+        with open(os.path.join(local_folder, file_name), 'wb') as f:
+            f.write(xml_data)
+
     manifest_rows.append({
-        'file_path': os.path.relpath(path, OUTPUT_DIR).replace(os.sep, '/'),
+        'file_path': s3_path,
         'ma_goi_tin': ma_goi_tin, 'kich_ban': scenario, 'su_kien': su_kien,
         'id_ho_so': id_ho_so, 'ngay_cap_nhat': t.strftime('%Y-%m-%d %H:%M:%S'), 'ghi_chu': note,
     })

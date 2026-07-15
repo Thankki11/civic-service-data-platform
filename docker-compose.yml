@@ -220,6 +220,37 @@ services:
       - source_db
       - kafka
 
+  data-master-gen:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: data-master-gen
+    profiles: ["manual"]
+    command: ["python", "data-generator/data_master.py"]
+    networks:
+      - spark-network
+    volumes:
+      - K:\Data_Platform:/app
+    depends_on:
+      - source_db
+
+  data-transactional-gen:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: data-transactional-gen
+    profiles: ["manual"]
+    command: ["python", "data-generator/data_Transactional.py"]
+    networks:
+      - spark-network
+    volumes:
+      - K:\Data_Platform:/app
+    environment:
+      - MINIO_ENDPOINT=http://minio:9000
+      - PYTHONIOENCODING=utf-8
+    depends_on:
+      - minio
+
 volumes:
   minio_storage:
   source_db_data:

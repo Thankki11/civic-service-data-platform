@@ -51,6 +51,29 @@ def validate_and_extract_udf(xml_string):
     Nếu lỗi cấu trúc hoặc parse hỏng, sẽ ném cờ is_valid = False kèm theo lý do để đẩy vào Quarantine.
     """
     import xml.etree.ElementTree as ET
+    import json
+    
+    def xml_to_dict(elem):
+        d = {}
+        if elem.attrib:
+            d.update({('@' + k): v for k, v in elem.attrib.items()})
+        if len(elem) > 0:
+            for child in elem:
+                val = xml_to_dict(child)
+                if child.tag in d:
+                    if type(d[child.tag]) is list:
+                        d[child.tag].append(val)
+                    else:
+                        d[child.tag] = [d[child.tag], val]
+                else:
+                    d[child.tag] = val
+        else:
+            if not d:
+                return elem.text
+            else:
+                d['#text'] = elem.text
+        return d
+        
     if not xml_string or not xml_string.strip():
         return (False, "File rỗng hoặc không có nội dung", [])
         
@@ -91,9 +114,8 @@ def validate_and_extract_udf(xml_string):
             if du_lieu_node is None:
                 return (False, "Thiếu thẻ <du_lieu> bao bọc payload", [])
                 
-            # Để tuân thủ đúng chuẩn Medallion Architecture (Bronze = RAW):
-            # Chúng ta KHÔNG chuyển đổi sang JSON ở đây, mà sẽ giữ nguyên gốc XML của thẻ <du_lieu>
-            data_payload = ET.tostring(du_lieu_node, encoding='unicode')
+            # Chuyển đổi thẻ <du_lieu> từ XML sang chuỗi JSON để lưu vào Bronze
+            data_payload = json.dumps(xml_to_dict(du_lieu_node), ensure_ascii=False)
             
             results.append((ma_goi_tin, ma_du_lieu, loai_du_lieu, ngay_cap_nhat, su_kien, id_ban_ghi, data_payload))
             

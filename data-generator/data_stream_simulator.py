@@ -216,7 +216,7 @@ def worker_fire_batch(batch_size):
             conn.close()
 
 def simulate_auto_stream(speed_per_second):
-    logging.info(f"🚀 BẮT ĐẦU AUTO CDC STREAMING (IN-MEMORY) - Tốc độ: {speed_per_second} req/s")
+    logging.info(f" BẮT ĐẦU AUTO CDC STREAMING - Tốc độ: {speed_per_second} req/s")
     
     batch_size = speed_per_second
     
@@ -230,6 +230,7 @@ def simulate_auto_stream(speed_per_second):
             logging.info(f"[*] Da tu sinh va na {batch_size} goi XML vao PostgreSQL")
             
             # Cân bằng tốc độ để đạt đúng req/s
+            time.sleep(random.randint(5, 30))
             elapsed = time.time() - start_time
             sleep_time = 1.0 - elapsed
             if sleep_time > 0:
@@ -240,12 +241,9 @@ if __name__ == "__main__":
     print(" IN-MEMORY AUTO CDC STREAMING SIMULATOR ")
     print("="*60)
     fetch_initial_ids()
-    try:
-        speed = int(input("Nhập tốc độ bắn (số sự kiện / giây) [Mặc định: 50]: ") or "50")
-    except (ValueError, EOFError):
-        speed = 50
+    speed = 1
         
     try:
         simulate_auto_stream(speed)
     except KeyboardInterrupt:
-        print("\n⏹️ Đã dừng chiến dịch Stress Test.")
+        print("\n Stop")
