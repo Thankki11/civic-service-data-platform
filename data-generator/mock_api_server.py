@@ -35,7 +35,8 @@ def get_recent_payments():
             "tax_code": fake.bothify(text='TAX-########'),
             "amount": random.choice([50000, 100000, 200000]),
             "method": random.choice(["Chuyen_khoan", "Vi_dien_tu", "Tien_mat_tai_quay"]),
-            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S')
+            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "ingested_at": int(time.time() * 1000)
         }
         payments.append(payment)
     

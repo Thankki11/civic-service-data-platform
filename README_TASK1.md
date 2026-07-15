@@ -12,10 +12,16 @@ Dưới đây là hướng dẫn chi tiết các bước để khởi chạy và
 
 ##  2. Khởi động hạ tầng (Infrastructure)
 
-Chạy lệnh sau để khởi động toàn bộ cụm hạ tầng bao gồm: PostgreSQL, MinIO, Kafka, Zookeeper, Debezium, Spark Master/Worker, Hive Metastore và Mock API:
+Chạy lệnh sau để khởi động toàn bộ cụm hạ tầng bao gồm: PostgreSQL, MinIO, Kafka, Zookeeper, Debezium, Spark Master/Worker, Hive Metastore, NiFi và Mock API:
 
 ```bash
 docker-compose up -d
+```
+
+**Lưu ý quan trọng đối với NiFi:**
+Sau khi các container khởi động, bạn phải chạy script sau (mở Terminal mới) để tự động cài đặt thư viện AWS S3 vào bên trong NiFi, giúp NiFi có thể ghi dữ liệu xuống Iceberg. Chờ khoảng 1-2 phút cho NiFi khởi động lại:
+```bash
+python setup_nifi_s3.py
 ```
 
 
@@ -54,12 +60,14 @@ Sau khi đồng bộ xong, gọi Spark chạy luồng xử lý XML (Job 2):
 /opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/spark-data/ingestion/spark-batch/job2_transactional_xml.py
 ```
 
-### 4.3. Nạp dữ liệu qua API (Job 4)
-Mock API Server (cổng 5000) đã tự động chạy qua file `docker-compose.yml`. Dùng Spark để gọi API lấy dữ liệu thanh toán và ghi vào Iceberg:
-```bash
-/opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/spark-data/ingestion/nifi/job4_api_ingestion.py
-```
+### 4.3. Nạp dữ liệu qua API bằng Apache NiFi (Job 4)
+Mock API Server (cổng 5000) tự động sinh ra các giao dịch thanh toán định dạng JSON. Chúng ta sử dụng **Apache NiFi** thay vì Spark để hút dữ liệu này tự động vào Iceberg.
 
+**Các bước chạy trên giao diện NiFi:**
+1. Truy cập NiFi tại `https://localhost:8443/nifi` (Tài khoản/Mật khẩu mặc định trong docker-compose: `admin` / `adminadminadmin`).
+2. Bật (Enable) các dịch vụ nền tảng: `JsonTreeReader` và `HiveCatalogService`.
+3. Nhấp chuột phải vào khối **`InvokeHTTP`** (kết nối với `http://mock-api:5000/api/payments/recent`) và khối **`PutIceberg`**, chọn **Start**.
+4. NiFi sẽ định kỳ hút dữ liệu (ví dụ: mỗi 10 phút/lần) từ API và tự động ghi nối tiếp (append) vào bảng `bronze_api.payment_transactions` trên Iceberg mà không cần code Spark.
 
 ##  5. Khởi chạy luồng Dữ liệu Streaming CDC (Real-time Ingestion)
 

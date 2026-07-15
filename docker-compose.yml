@@ -134,7 +134,7 @@ services:
       - spark-network
 
   nifi:
-    image: apache/nifi:latest
+    image: apache/nifi:1.25.0
     container_name: nifi
     ports:
       - "8443:8443"
@@ -143,6 +143,12 @@ services:
       - SINGLE_USER_CREDENTIALS_PASSWORD=adminadminadmin
     networks:
       - spark-network
+    volumes:
+      - K:\Data_Platform\nifi_extensions\nifi-iceberg-processors-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-iceberg-processors-nar-1.25.0.nar
+      - K:\Data_Platform\nifi_extensions\nifi-iceberg-services-api-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-iceberg-services-api-nar-1.25.0.nar
+      - K:\Data_Platform\nifi_extensions\nifi-iceberg-services-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-iceberg-services-nar-1.25.0.nar
+      - K:\Data_Platform\nifi_extensions\nifi-hive-services-api-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-hive-services-api-nar-1.25.0.nar
+      - K:\Data_Platform\nifi_core_site.xml:/opt/nifi/nifi-current/conf/core-site.xml
 
   metastore-db:
     image: postgres:11

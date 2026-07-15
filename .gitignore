@@ -1,5 +1,3 @@
-<<<<<<< HEAD
-# Credential & config that
 .env
 *.pem
 *.key
@@ -10,31 +8,27 @@ __pycache__/
 .venv/
 venv/
 
-# Spark / Java
 *.jar
 jars/
 spark-warehouse/
 metastore_db/
 derby.log
 
-# Airflow
 orchestration/logs/
 airflow.db
 airflow.cfg
 webserver_config.py
 
-# Data - khong commit du lieu that
 data/
 *.parquet
 *.csv
 !warehouse/validation/*.csv
 
-# IDE / OS
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
-=======
 mock_database_csv
 raw
->>>>>>> Ingestion
+
+nifi_extensions
