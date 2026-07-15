@@ -1,12 +1,34 @@
--- Data Validation — Trung
--- Doi soat so lieu tren BI voi du lieu nguon goc (theo bang action items)
--- Chay tren Trino, so ket qua voi con so tren dashboard.
+-- Run in Trino after a batch. These are reconciliation checks, not dashboard SQL.
 
--- 1. Tong ban ghi qua cac tang phai giai thich duoc chenh lech (dedup o Silver)
-SELECT 'bronze' AS layer, count(*) AS cnt FROM iceberg.bronze.raw_xml
+-- Bronze -> Silver counts have expected differences because one XML packet can
+-- emit a history record, no history record, and/or a payment record.
+SELECT 'bronze_xml_packets' AS dataset, count(*) AS row_count
+FROM iceberg.bronze_dvc_xml.application_xml
 UNION ALL
-SELECT 'silver', count(*) FROM iceberg.silver.cleaned
+SELECT 'silver_application_events', count(*)
+FROM iceberg.silver.application_events
 UNION ALL
-SELECT 'gold_fact', sum(total_records) FROM iceberg.gold.fact_main;
+SELECT 'silver_application_history', count(*)
+FROM iceberg.silver.application_history
+UNION ALL
+SELECT 'silver_payment', count(*)
+FROM iceberg.silver.payment
+UNION ALL
+SELECT 'gold_backlog_rows', count(*)
+FROM iceberg.gold.fact_ton_dong_ho_so
+UNION ALL
+SELECT 'gold_agency_day_rows', count(*)
+FROM iceberg.gold.fact_van_hanh_co_quan;
 
--- 2. TODO: doi soat tung KPI theo Data Dictionary
+-- A Gold agency/day total must reconcile to its atomic backlog snapshot.
+SELECT
+    f.thoi_gian_id,
+    f.co_quan_id,
+    f.so_luong_ton_dong AS gold_ton_dong,
+    count(b.ho_so_id) AS snapshot_ton_dong
+FROM iceberg.gold.fact_van_hanh_co_quan f
+LEFT JOIN iceberg.gold.fact_ton_dong_ho_so b
+    ON b.thoi_gian_id = f.thoi_gian_id
+   AND b.co_quan_id = f.co_quan_id
+GROUP BY 1, 2, 3
+HAVING f.so_luong_ton_dong <> count(b.ho_so_id);

@@ -74,6 +74,21 @@ services:
     networks:
       - spark-network
 
+  # Single-node StarRocks is sufficient for local development. It exposes the
+  # MySQL protocol on 9030 (DDL/Routine Load) and the HTTP UI on 8030.
+  # Production should replace this all-in-one container with separate FE/BE
+  # nodes and replication_num >= 3.
+  starrocks:
+    image: starrocks/allin1-ubuntu
+    container_name: starrocks
+    hostname: starrocks
+    ports:
+      - "8030:8030"
+      - "9030:9030"
+      - "8040:8040"
+    networks:
+      - spark-network
+
 
   spark-master:
     build:
