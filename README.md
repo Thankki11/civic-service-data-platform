@@ -44,7 +44,7 @@ Hệ thống Data Lakehouse end-to-end: **Ingestion → Bronze → Silver → Go
 | `transform/`     | Quân            | Spark ETL/Agg, StarRocks, Hive Metastore             |
 | `orchestration/` | Thành           | Airflow DAGs, alert, Jenkins CI/CD                   |
 | `warehouse/`     | Trung           | DDL Dim/Fact, SQL Trino, Superset, data validation   |
-| `data-generator/`| Chung           | Script sinh file XML mẫu vào Landing Zone            |
+| `data-generator/`| Kiên            | Script sinh file XML mẫu vào Landing Zone, sinh data API, data vào DB OLTP |
 | `docs/`          | Chung           | Kiến trúc + Data Dictionary                          |
 
 ## Khởi động môi trường

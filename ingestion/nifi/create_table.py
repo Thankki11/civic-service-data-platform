@@ -36,4 +36,4 @@ spark.sql("""
     PARTITIONED BY (days(ingested_at))
     LOCATION 's3a://lakehouse/warehouse/bronze/api/payment_transaction'
 """)
-print("TABLE CREATED SUCCESSFULLY!")
+print("TABLE CREATED SUCCESSFULLY")
