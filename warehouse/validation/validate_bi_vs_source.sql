@@ -5,8 +5,8 @@
 SELECT 'bronze_xml_packets' AS dataset, count(*) AS row_count
 FROM iceberg.bronze_dvc_xml.application_xml
 UNION ALL
-SELECT 'silver_application_events', count(*)
-FROM iceberg.silver.application_events
+SELECT 'silver_application', count(*)
+FROM iceberg.silver.application
 UNION ALL
 SELECT 'silver_application_history', count(*)
 FROM iceberg.silver.application_history

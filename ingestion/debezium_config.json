@@ -10,6 +10,7 @@
         "database.dbname": "source_db",
         "topic.prefix": "postgres_server",
         "table.include.list": "public.Application,public.Application_History,public.Document,public.Applicant",
-        "plugin.name": "pgoutput"
+        "plugin.name": "pgoutput",
+        "tombstones.on.delete": "false"
     }
 }

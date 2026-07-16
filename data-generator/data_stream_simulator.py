@@ -160,7 +160,33 @@ def worker_fire_batch(batch_size):
                     known_ids.append(app_id)
                 else:
                     app_id = random.choice(known_ids)
-                    new_status = random.randint(2, 7)
+                    # Application_History la audit log chuyen trang thai. Lay
+                    # dung trang thai hien tai tu OLTP truoc khi update thay vi
+                    # ghi co dinh Statusid = 1 (RECEIVED) cho moi event.
+                    cursor.execute(
+                        'SELECT "Statusid" FROM "Application" WHERE id = %s',
+                        (app_id,),
+                    )
+                    current_status_row = cursor.fetchone()
+                    if current_status_row is None:
+                        continue
+
+                    previous_status = current_status_row[0]
+                    # Luong nghiep vu hop le: RECEIVED -> ASSIGNED ->
+                    # PROCESSING -> PENDING_APPROVAL -> APPROVED -> READY ->
+                    # COMPLETED; REJECTED va COMPLETED la trang thai ket thuc.
+                    next_statuses = {
+                        1: [2],
+                        2: [3],
+                        3: [4, 8],
+                        4: [5],
+                        5: [6],
+                        6: [7],
+                    }
+                    candidate_statuses = next_statuses.get(previous_status, [])
+                    if not candidate_statuses:
+                        continue
+                    new_status = random.choice(candidate_statuses)
                     
                     cursor.execute("""
                         UPDATE "Application"
@@ -173,7 +199,7 @@ def worker_fire_batch(batch_size):
                     cursor.execute("""
                         INSERT INTO "Application_History" (id, "Applicationid", "Statusid", "Statusid2", "Officerid", action_time)
                         VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    """, (hist_id, app_id, 1, new_status, officer_id))
+                    """, (hist_id, app_id, previous_status, new_status, officer_id))
 
                 # ========================================================
                 # 2. BẮN ĐẠN CHO APPLICANT (Người nộp) - SCD/Streaming

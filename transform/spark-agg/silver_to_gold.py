@@ -1,375 +1,351 @@
-"""Create the two daily batch Gold facts from Silver application entities.
+# ============================================================================
+# JOB: Silver -> Gold (batch facts)
+# File : transform/spark-agg/silver_to_gold.py
+# Phu trach: Quan (DE)  |  Lich chay: dag_transform (Airflow, hang ngay ~2h sang)
+#
+# MUC DICH
+#   Tinh 2 bang FACT hang ngay theo dung DDL cua Trung
+#   (warehouse/ddl/gold_dim_fact.sql):
+#     - gold.fact_ton_dong_ho_so   : Periodic Snapshot Fact, grain = 1 ngay/1 ho so
+#                                     dang mo (chua COMPLETED/REJECTED)
+#     - gold.fact_van_hanh_co_quan : Aggregated Fact, grain = 1 ngay/1 co quan
+#
+#   fact_xu_ly_ho_so (transactional, grain = 1 hanh dong xu ly) KHONG duoc
+#   tinh o day - theo dung thiet ke da thong nhat, bang nay duoc phuc vu
+#   REAL-TIME truc tiep tu StarRocks (xem transform/starrocks/ddl_realtime.sql).
+#
+#   5 bang DIM (it thay doi) KHONG duoc build o day - nhom load thu cong
+#   qua transform/spark-agg/build_dim_tables.py khi danh muc thay doi.
+#
+# LUU Y VE 1 CHO LECH KIEU DU LIEU DA PHAT HIEN TRONG DDL GOC
+#   warehouse/ddl/gold_dim_fact.sql khai bao "ho_so_id BIGINT" o ca 3 fact,
+#   nhung ma ho so thuc te trong he thong nguon la CHUOI dang "HS_00001"
+#   (xem Application.id, id_ban_ghi trong XML...). Neu giu BIGINT se buoc
+#   phai quy uoc "bo tien to HS_ + cast so" moi noi join - de gay loi khi
+#   dinh dang ID thay doi ve sau. Job nay tao ho_so_id la STRING (dung voi
+#   du lieu thuc), va de nghi sua lai 2 dong DDL tuong ung (da sua kem trong
+#   ban giao, xem phan mo ta). Cot surrogate key "id" van la BIGINT nhu DDL
+#   goc, dung ham bam xxhash64(thoi_gian_id, khoa nghiep vu) de tao ra.
+#
+# NGAY CHOT SO DEMO
+#   Job batch cua demo luon chot so cho HOM QUA, phu hop DAG chay luc 2h sang.
+#   Khong ho tro backfill lich su trong pham vi demo nay.
+#
+# GHI DE THEO PARTITION (khong lam mat lich su cac ngay khac)
+#   2 bang fact deu PARTITIONED BY (thoi_gian_id) - moi ngay 1 partition.
+#   Bat spark.sql.sources.partitionOverwriteMode=dynamic de .mode("overwrite")
+#   CHI thay the dung partition co trong DataFrame dang ghi (1 ngay
+#   snapshot_date), khong dung tay vao du lieu cac ngay khac da co san.
+#
+# THIET KE TRANH OOM
+#   - Cac phep tinh cap "co quan" join tren tap Agency/Service RAT NHO ->
+#     dung broadcast() de tranh shuffle khong can thiet
+#   - Khong dung .collect()/.toPandas()
+#   - AQE bat san (giong bronze_to_silver.py)
+# ============================================================================
 
-The job is intentionally parameterised by an *as-of date*.  Re-running a day
-first deletes only that Iceberg partition and then writes it again, so it is
-safe for Airflow retries and for backfilling the supplied June/July XML archive.
+from datetime import datetime, timedelta
 
-Dimension tables are not rebuilt here.  They are small controlled reference
-datasets and must be loaded into ``lakehouse.gold`` before this job runs.
-"""
-
-import argparse
-from datetime import date, datetime
-
-from pyspark.sql import DataFrame, SparkSession, Window
+from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 
+# ---------------------------------------------------------------------------
+# 0. NGAY CHOT SO
+# ---------------------------------------------------------------------------
+snapshot_date = (datetime.now() - timedelta(days=1)).date()
 
-SILVER_EVENTS = "lakehouse.silver.application_events"
-SILVER_HISTORY = "lakehouse.silver.application_history"
-SILVER_PAYMENT = "lakehouse.silver.payment"
+cutoff_ts = f"{snapshot_date} 23:59:59"          # moc thoi gian chot so trong ngay
+thoi_gian_id = int(snapshot_date.strftime("%Y%m%d"))
+print(f"[*] Chay Gold aggregation cho snapshot_date = {snapshot_date} (thoi_gian_id={thoi_gian_id})")
 
-DIM_TIME = "lakehouse.gold.dim_thoi_gian"
-DIM_STATUS = "lakehouse.gold.dim_trang_thai"
-DIM_SERVICE = "lakehouse.gold.dim_dich_vu_cong"
-FACT_BACKLOG = "lakehouse.gold.fact_ton_dong_ho_so"
-FACT_AGENCY = "lakehouse.gold.fact_van_hanh_co_quan"
+STATUS_COMPLETED = 7
+STATUS_REJECTED = 8
 
+# ---------------------------------------------------------------------------
+# 1. SPARK SESSION
+# ---------------------------------------------------------------------------
+MINIO_ENDPOINT = "http://minio:9000"
+MINIO_ACCESS_KEY = "minio_access_key"
+MINIO_SECRET_KEY = "minio_secret_key"
+ICEBERG_WAREHOUSE = "s3a://lakehouse/warehouse/"
+CATALOG = "lakehouse"
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build daily Gold public-service facts")
-    parser.add_argument(
-        "--as-of-date",
-        default=date.today().isoformat(),
-        help="Snapshot date in YYYY-MM-DD; default is the Spark job's current date.",
-    )
-    args = parser.parse_args()
-    try:
-        args.as_of_date = datetime.strptime(args.as_of_date, "%Y-%m-%d").date()
-    except ValueError as exc:
-        parser.error("--as-of-date phai co dang YYYY-MM-DD")
-        raise exc  # Kept for static analysers; argparse.error exits.
-    return args
-
-
-def build_spark() -> SparkSession:
-    return (
-        SparkSession.builder.appName("silver-to-gold-dvc")
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-        .config("spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.lakehouse.type", "hive")
-        .config("spark.sql.catalog.lakehouse.uri", "thrift://hive-metastore:9083")
-        .config("spark.sql.catalog.lakehouse.warehouse", "s3a://lakehouse/warehouse/")
-        .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000")
-        .config("spark.hadoop.fs.s3a.access.key", "minio_access_key")
-        .config("spark.hadoop.fs.s3a.secret.key", "minio_secret_key")
-        .config("spark.hadoop.fs.s3a.path.style.access", "true")
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-        .config("spark.sql.session.timeZone", "Asia/Ho_Chi_Minh")
-        .config("spark.sql.adaptive.enabled", "true")
-        .getOrCreate()
-    )
+spark = (
+    SparkSession.builder
+    .appName(f"Transform_SilverToGold_{snapshot_date}")
+    .config("spark.hadoop.fs.s3a.endpoint", MINIO_ENDPOINT)
+    .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY)
+    .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY)
+    .config("spark.hadoop.fs.s3a.path.style.access", "true")
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config(f"spark.sql.catalog.{CATALOG}", "org.apache.iceberg.spark.SparkCatalog")
+    .config(f"spark.sql.catalog.{CATALOG}.type", "hive")
+    .config(f"spark.sql.catalog.{CATALOG}.uri", "thrift://hive-metastore:9083")
+    .config(f"spark.sql.catalog.{CATALOG}.warehouse", ICEBERG_WAREHOUSE)
+    .config("spark.sql.adaptive.enabled", "true")
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+    .config("spark.sql.adaptive.skewJoin.enabled", "true")
+    # Quan trong: chi ghi de dung partition (ngay) dang xu ly, giu nguyen lich su
+    .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.gold")
 
 
-def require_tables(spark: SparkSession, table_names: list[str]) -> None:
-    missing = [name for name in table_names if not spark.catalog.tableExists(name)]
-    if missing:
-        raise RuntimeError(
-            "Thieu bang bat buoc: "
-            + ", ".join(missing)
-            + ". Hay chay DDL Gold va nap dimension thu cong truoc khi aggregate."
-        )
+def save_gold_partitioned(df, table_name):
+    full_name = f"{CATALOG}.gold.{table_name}"
+    schema_sql = ", ".join(f"`{f.name}` {f.dataType.simpleString()}" for f in df.schema.fields)
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {full_name} ({schema_sql})
+        USING iceberg
+        PARTITIONED BY (thoi_gian_id)
+        LOCATION 's3a://lakehouse/warehouse/gold/{table_name}'
+    """)
+    df.write.format("iceberg").mode("overwrite").save(full_name)
+    print(f"[+] gold.{table_name} <- da ghi partition thoi_gian_id={thoi_gian_id}")
 
 
-def ensure_fact_tables(spark: SparkSession) -> None:
-    """Keep the job deployable even when only the DDL has not been run yet."""
-    spark.sql("CREATE NAMESPACE IF NOT EXISTS lakehouse.gold")
-    spark.sql(
-        f"""
-        CREATE TABLE IF NOT EXISTS {FACT_BACKLOG} (
-            id STRING, ho_so_id STRING, trang_thai_id INT, co_quan_id INT,
-            can_bo_id INT, dv_cong_id INT, so_ngay_ton_dong_hien_tai INT,
-            tong_thoi_gian_da_xu_ly INT, so_luong INT, thoi_gian_id INT
-        ) USING iceberg PARTITIONED BY (thoi_gian_id)
-        """
-    )
-    spark.sql(
-        f"""
-        CREATE TABLE IF NOT EXISTS {FACT_AGENCY} (
-            id STRING, co_quan_id INT, so_luong_tiep_nhan INT,
-            so_luong_dung_han INT, so_luong_tre_han INT, so_luong_rework INT,
-            so_luong_ton_dong INT, tong_chi_phi BIGINT, thoi_gian_id INT
-        ) USING iceberg PARTITIONED BY (thoi_gian_id)
-        """
+silver_application = spark.table(f"{CATALOG}.silver.application")
+silver_history = spark.table(f"{CATALOG}.silver.application_history")
+silver_service = spark.table(f"{CATALOG}.silver.service").select(
+    F.col("id").alias("dv_cong_id"), F.col("processing_time")
+)
+silver_agency = spark.table(f"{CATALOG}.silver.agency").select(F.col("id").alias("co_quan_id"))
+silver_payment = spark.table(f"{CATALOG}.silver.payment")
+
+# Calendar is a small controlled dimension.  Do not calculate SLA with
+# timestamp / 86400: that counts Saturday, Sunday and configured holidays.
+calendar = spark.table(f"{CATALOG}.gold.dim_thoi_gian").select(
+    F.col("ngay_date").cast("date").alias("ngay_date"),
+    F.col("stt_ngay_lam_viec").cast("int").alias("stt_ngay_lam_viec"),
+)
+if calendar.filter(F.col("ngay_date") == F.lit(str(snapshot_date))).limit(1).count() == 0:
+    raise RuntimeError(
+        f"dim_thoi_gian chua co ngay {snapshot_date}; hay chay build_dim_tables.py truoc Gold job."
     )
 
-
-def latest_application_as_of(events: DataFrame, cutoff_ts: str) -> DataFrame:
-    """Reconstruct the application state valid at cutoff from full + partial events."""
-    state_window = (
-        Window.partitionBy("ho_so_id")
-        .orderBy(F.col("event_ts").asc_nulls_last(), F.col("ma_goi_tin").asc())
-        .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+calendar_created = F.broadcast(calendar.select(
+    F.col("ngay_date").alias("created_date"),
+    F.col("stt_ngay_lam_viec").alias("created_workday_seq"),
+))
+calendar_action = F.broadcast(calendar.select(
+    F.col("ngay_date").alias("action_date"),
+    F.col("stt_ngay_lam_viec").alias("action_workday_seq"),
+))
+calendar_cutoff = F.broadcast(
+    calendar.filter(F.col("ngay_date") == F.lit(str(snapshot_date))).select(
+        F.col("stt_ngay_lam_viec").alias("cutoff_workday_seq")
     )
-    latest_window = Window.partitionBy("ho_so_id").orderBy(
-        F.col("event_ts").desc_nulls_last(), F.col("ma_goi_tin").desc()
+)
+
+# ===========================================================================
+# 2. FACT_TON_DONG_HO_SO  (Periodic Snapshot Fact - 1 dong/1 ngay/1 ho so mo)
+#    Mapping logic theo dung bao cao thuc tap (muc "Mapping Logic - Fact
+#    Xu Ly & Fact Ton Dong"):
+#      so_ngay_ton_dong_hien_tai = Moc chot (23:59:59) - action_time cua
+#                                  buoc trang thai hien tai (lan cap nhat
+#                                  gan nhat tinh den cutoff)
+#      tong_thoi_gian_da_xu_ly   = Moc chot (23:59:59) - Application.created_at
+# ===========================================================================
+# Trang thai/can bo "as-of" phai lay tu history truoc moc chot. Khong duoc
+# dung trang_thai hien tai cua silver.application: job Gold chay luc 02:00
+# co the da nhin thay thay doi cua ngay moi va lam sai snapshot hom qua.
+w_latest_before_cutoff = Window.partitionBy("ho_so_id").orderBy(F.col("action_time").desc())
+latest_state_as_of_cutoff = (
+    silver_history
+    .filter(F.col("action_time") <= F.lit(cutoff_ts))
+    .withColumn("rn", F.row_number().over(w_latest_before_cutoff))
+    .filter("rn = 1")
+    .select(
+        "ho_so_id",
+        F.col("trang_thai_id").alias("trang_thai_id_as_of"),
+        F.col("can_bo_id"),
+        F.col("action_time").alias("latest_action_time"),
     )
-    return (
-        events.filter(F.col("event_ts") <= F.lit(cutoff_ts).cast("timestamp"))
-        .withColumn("ten_ho_so", F.last("ten_ho_so", ignorenulls=True).over(state_window))
-        .withColumn("dv_cong_id", F.last("dv_cong_id", ignorenulls=True).over(state_window))
-        .withColumn("co_quan_id", F.last("co_quan_id", ignorenulls=True).over(state_window))
-        .withColumn("created_at", F.last("created_at", ignorenulls=True).over(state_window))
-        .withColumn("trang_thai_id", F.last("trang_thai_id", ignorenulls=True).over(state_window))
-        .withColumn("is_deleted", F.col("su_kien") == F.lit("DELETE"))
-        .withColumn("_latest_rank", F.row_number().over(latest_window))
-        .filter((F.col("_latest_rank") == 1) & ~F.col("is_deleted"))
-        .drop("_latest_rank")
+)
+
+# Application giu cac thuoc tinh on dinh (co quan, dich vu, ngay nop). Trang
+# thai de quyet dinh ton dong phai la trang thai cua history tai cutoff.
+# Neu event DELETE xay ra SAU cutoff, ho so van phai xuat hien trong snapshot
+# cua ngay truoc; neu DELETE xay ra truoc cutoff thi loai ra.
+open_apps = (
+    silver_application
+    .filter(
+        (F.col("created_at") <= F.lit(cutoff_ts))
+        & ((F.col("da_bi_xoa") == False) | (F.col("event_time") > F.lit(cutoff_ts)))  # noqa: E712
     )
-
-
-def build_calendar(spark: SparkSession, as_of_date: date) -> tuple[DataFrame, DataFrame]:
-    """Expose working-day sequence values for O(1) ageing/SLA calculations."""
-    calendar = spark.table(DIM_TIME).select(
-        "thoi_gian_id",
-        F.col("ngay").cast("date").alias("ngay"),
-        F.coalesce(F.col("co_phai_la_ngay_nghi"), F.lit(False)).alias("co_phai_la_ngay_nghi"),
-        F.col("stt_ngay_lam_viec").cast("int").alias("stt_ngay_lam_viec"),
+    .join(latest_state_as_of_cutoff, on="ho_so_id", how="left")
+    .withColumn(
+        "trang_thai_id",
+        F.coalesce(F.col("trang_thai_id_as_of"), F.col("trang_thai_id")),
     )
-    as_of_calendar = calendar.filter(F.col("ngay") == F.lit(as_of_date.isoformat()).cast("date"))
-    if as_of_calendar.limit(1).count() == 0:
-        raise RuntimeError(f"dim_thoi_gian chua co ngay chot {as_of_date.isoformat()}")
-    return calendar, as_of_calendar.select(
-        F.col("thoi_gian_id").alias("as_of_thoi_gian_id"),
-        F.col("stt_ngay_lam_viec").alias("as_of_workday_seq"),
+    .filter(~F.col("trang_thai_id").isin(STATUS_COMPLETED, STATUS_REJECTED))
+)
+
+fact_ton_dong_raw = (
+    open_apps.repartition(16, "ho_so_id")
+    .join(calendar_created, F.to_date("created_at") == F.col("created_date"), "left")
+    .join(calendar_action, F.to_date("latest_action_time") == F.col("action_date"), "left")
+    .crossJoin(calendar_cutoff)
+    .withColumn("can_bo_id", F.coalesce(F.col("can_bo_id"), F.lit(-1)))
+    .withColumn(
+        "so_ngay_ton_dong_hien_tai",
+        F.greatest(
+            F.col("cutoff_workday_seq")
+            - F.coalesce(F.col("action_workday_seq"), F.col("created_workday_seq")),
+            F.lit(0),
+        ).cast("int"),
     )
-
-
-def add_business_age(applications: DataFrame, calendar: DataFrame, as_of_calendar: DataFrame) -> DataFrame:
-    """Add application age and current-status age using manual calendar reference data."""
-    start_calendar = calendar.select(
-        F.col("ngay").alias("created_date"), F.col("stt_ngay_lam_viec").alias("created_workday_seq")
+    .withColumn(
+        "tong_thoi_gian_da_xu_ly",
+        F.greatest(F.col("cutoff_workday_seq") - F.col("created_workday_seq"), F.lit(0)).cast("int"),
     )
-    status_calendar = calendar.select(
-        F.col("ngay").alias("status_date"), F.col("stt_ngay_lam_viec").alias("status_workday_seq")
+)
+
+fact_ton_dong_ho_so = fact_ton_dong_raw.select(
+    F.xxhash64(F.lit(thoi_gian_id), F.col("ho_so_id")).alias("id"),   # surrogate key BIGINT
+    F.col("ho_so_id"),                                                 # STRING - xem ghi chu dau file
+    F.col("trang_thai_id"),
+    F.col("co_quan_id"),
+    F.col("can_bo_id"),
+    F.col("dv_cong_id"),
+    F.col("so_ngay_ton_dong_hien_tai"),
+    F.col("tong_thoi_gian_da_xu_ly"),
+    F.lit(1).alias("so_luong"),
+    F.lit(thoi_gian_id).alias("thoi_gian_id"),
+)
+
+save_gold_partitioned(fact_ton_dong_ho_so, "fact_ton_dong_ho_so")
+
+# cache() vi bang nay nho (so ho so dang mo), duoc TAI SU DUNG ngay ben duoi
+# cho fact_van_hanh_co_quan.so_luong_ton_dong -> DAM BAO 2 fact luon khop so
+# (khong tinh backlog 2 lan bang 2 cach khac nhau -> tranh lech du lieu khi
+# len dashboard)
+fact_ton_dong_ho_so.cache()
+
+# ===========================================================================
+# 3. FACT_VAN_HANH_CO_QUAN (Aggregated Fact - 1 dong/1 ngay/1 co quan)
+# ===========================================================================
+
+# 3.1 So luong tiep nhan trong ngay
+received_today = (
+    silver_application
+    .filter(F.to_date("created_at") == F.lit(str(snapshot_date)))
+    .groupBy("co_quan_id")
+    .agg(F.count("*").alias("so_luong_tiep_nhan"))
+)
+
+# 3.2 So luong ton dong trong ngay = tai su dung fact_ton_dong_ho_so vua tinh
+backlog_today = (
+    fact_ton_dong_ho_so
+    .groupBy("co_quan_id")
+    .agg(F.sum("so_luong").alias("so_luong_ton_dong"))
+)
+
+# 3.3 Ho so COMPLETED trong ngay -> tach dung han / tre han
+#     (Tong thoi gian xu ly thuc te = COMPLETED.action_time - Application.
+#     created_at, so sanh voi Service.processing_time. Luong hien tai
+#     REJECTED la trang thai KET THUC - khong quay lai xu ly tiep - nen
+#     khong co buoc tru thoi gian REJECTED nhu mo ta cho truong hop tong
+#     quat hon trong bao cao.)
+completed_today = (
+    silver_history
+    .filter((F.col("trang_thai_id") == STATUS_COMPLETED) & (F.to_date("action_time") == F.lit(str(snapshot_date))))
+    .join(
+        silver_application.select("ho_so_id", "co_quan_id", "created_at", "dv_cong_id"),
+        on="ho_so_id", how="inner",
     )
-    aged = (
-        applications.join(start_calendar, F.to_date("created_at") == F.col("created_date"), "left")
-        .join(status_calendar, F.to_date("last_action_time") == F.col("status_date"), "left")
-        .crossJoin(as_of_calendar)
-        .withColumn(
-            "tong_thoi_gian_da_xu_ly",
-            F.greatest(F.coalesce(F.col("as_of_workday_seq") - F.col("created_workday_seq"), F.lit(0)), F.lit(0)),
-        )
-        .withColumn(
-            "so_ngay_ton_dong_hien_tai",
-            F.greatest(
-                F.coalesce(F.col("as_of_workday_seq") - F.col("status_workday_seq"), F.lit(0)), F.lit(0)
-            ),
-        )
+    .join(F.broadcast(silver_service), on="dv_cong_id", how="left")
+    .join(calendar_created, F.to_date("created_at") == F.col("created_date"), "left")
+    .join(calendar_action, F.to_date("action_time") == F.col("action_date"), "left")
+    .withColumn(
+        "tong_ngay_lam_viec_xu_ly",
+        F.greatest(F.col("action_workday_seq") - F.col("created_workday_seq"), F.lit(0)),
     )
-    return aged
-
-
-def completed_metrics(
-    history: DataFrame,
-    applications: DataFrame,
-    calendar: DataFrame,
-    as_of_date: date,
-) -> DataFrame:
-    """Count same-day COMPLETED transitions, split by business-day SLA."""
-    status = spark_table_with_alias(history.sparkSession, DIM_STATUS, "status").select(
-        F.col("trang_thai_id").alias("completed_status_id"), F.col("ma_trang_thai").alias("completed_status_code")
+    .withColumn(
+        "tre_han",
+        F.when(F.col("tong_ngay_lam_viec_xu_ly") > F.col("processing_time"), 1).otherwise(0),
     )
-    start_calendar = calendar.select(
-        F.col("ngay").alias("created_date"), F.col("stt_ngay_lam_viec").alias("created_workday_seq")
+)
+
+on_off_time_today = (
+    completed_today
+    .groupBy("co_quan_id")
+    .agg(
+        F.sum(F.when(F.col("tre_han") == 1, 1).otherwise(0)).alias("so_luong_tre_han_da_dong"),
+        F.sum(F.when(F.col("tre_han") == 0, 1).otherwise(0)).alias("so_luong_dung_han"),
     )
-    end_calendar = calendar.select(
-        F.col("ngay").alias("completed_date"), F.col("stt_ngay_lam_viec").alias("completed_workday_seq")
+)
+
+# Theo bao cao nghiep vu, KPI tre han gom ca 2 nhom: da COMPLETED tre va
+# dang ton nhung tuoi ho so da vuot SLA. Nhom thu hai lay truc tiep tu fact
+# snapshot vua tao de cung mot dinh nghia ton dong tren moi dashboard.
+overdue_open_today = (
+    fact_ton_dong_ho_so
+    .join(F.broadcast(silver_service), on="dv_cong_id", how="left")
+    .filter(F.col("tong_thoi_gian_da_xu_ly") > F.col("processing_time"))
+    .groupBy("co_quan_id")
+    .agg(F.countDistinct("ho_so_id").alias("so_luong_tre_han_dang_mo"))
+)
+
+# 3.4 Rework: KHONG CO trang thai rieng "yeu cau bo sung" trong 8 status hien
+#     co (chi co PENDING_APPROVAL = cho ky duyet, KHAC nghia voi "cho bo
+#     sung"). TAM DUNG REJECTED lam proxy gan nhat cho "ho so bi tra lai" -
+#     CAN DOI NGHIEP VU XAC NHAN LAI, hoac bo sung 1 status/flag rieng
+#     "YEU_CAU_BO_SUNG" trong tuong lai de do chinh xac hon.
+rework_today = (
+    silver_history
+    .filter((F.col("trang_thai_id") == STATUS_REJECTED) & (F.to_date("action_time") == F.lit(str(snapshot_date))))
+    .join(silver_application.select("ho_so_id", "co_quan_id"), on="ho_so_id", how="inner")
+    .groupBy("co_quan_id")
+    .agg(F.count("*").alias("so_luong_rework"))
+)
+
+# 3.5 Tong chi phi thu trong ngay
+fee_today = (
+    silver_payment
+    .filter(
+        (F.to_date("thoi_gian_tt") == F.lit(str(snapshot_date)))
+        & (F.upper(F.col("trang_thai_tt")) == F.lit("SUCCESS"))
     )
-    completed = (
-        history.filter(F.to_date("action_time") == F.lit(as_of_date.isoformat()).cast("date"))
-        .join(status, F.col("trang_thai_id") == F.col("completed_status_id"), "inner")
-        .filter(F.col("completed_status_code") == F.lit("COMPLETED"))
-        .join(
-            applications.select("ho_so_id", "co_quan_id", "dv_cong_id", "created_at"),
-            "ho_so_id",
-            "inner",
-        )
-        .join(start_calendar, F.to_date("created_at") == F.col("created_date"), "left")
-        .join(end_calendar, F.to_date("action_time") == F.col("completed_date"), "left")
-        .withColumn(
-            "business_days_to_complete",
-            F.greatest(
-                F.coalesce(F.col("completed_workday_seq") - F.col("created_workday_seq"), F.lit(0)), F.lit(0)
-            ),
-        )
-        .dropDuplicates(["ho_so_id"])
+    .join(silver_application.select("ho_so_id", "co_quan_id"), on="ho_so_id", how="inner")
+    .groupBy("co_quan_id")
+    .agg(F.sum("so_tien").alias("tong_chi_phi"))
+)
+
+# 3.6 Hop nhat: xuat phat tu TOAN BO danh sach co quan (silver.agency) de moi
+#     co quan deu co 1 dong/ngay du hom do khong phat sinh gi (tranh dashboard
+#     "thieu cot" gay hieu nham la khong co du lieu)
+fact_van_hanh_co_quan = (
+    silver_agency
+    .join(received_today, "co_quan_id", "left")
+    .join(backlog_today, "co_quan_id", "left")
+    .join(on_off_time_today, "co_quan_id", "left")
+    .join(overdue_open_today, "co_quan_id", "left")
+    .join(rework_today, "co_quan_id", "left")
+    .join(fee_today, "co_quan_id", "left")
+    .fillna(0, subset=[
+        "so_luong_tiep_nhan", "so_luong_ton_dong", "so_luong_tre_han_da_dong",
+        "so_luong_tre_han_dang_mo", "so_luong_dung_han", "so_luong_rework", "tong_chi_phi",
+    ])
+    .select(
+        F.xxhash64(F.lit(thoi_gian_id), F.col("co_quan_id")).alias("id"),  # surrogate key BIGINT
+        F.col("co_quan_id"),
+        F.col("so_luong_tiep_nhan").cast("int"),
+        F.col("so_luong_dung_han").cast("int"),
+        (F.col("so_luong_tre_han_da_dong") + F.col("so_luong_tre_han_dang_mo")).cast("int").alias("so_luong_tre_han"),
+        F.col("so_luong_rework").cast("int"),
+        F.col("so_luong_ton_dong").cast("int"),
+        F.col("tong_chi_phi").cast("long"),
+        F.lit(thoi_gian_id).alias("thoi_gian_id"),
     )
-    service = spark_table_with_alias(history.sparkSession, DIM_SERVICE, "service").select(
-        F.col("dv_cong_id").alias("service_id"), F.col("thoi_han_tra_kq_ngay").alias("sla_ngay")
-    )
-    return (
-        completed.join(service, F.col("dv_cong_id") == F.col("service_id"), "left")
-        .groupBy("co_quan_id")
-        .agg(
-            F.sum(F.when(F.col("business_days_to_complete") > F.col("sla_ngay"), 1).otherwise(0)).cast("int").alias(
-                "so_luong_tre_han"
-            ),
-            F.sum(F.when(F.col("business_days_to_complete") <= F.col("sla_ngay"), 1).otherwise(0)).cast("int").alias(
-                "so_luong_dung_han"
-            ),
-        )
-    )
+)
 
+save_gold_partitioned(fact_van_hanh_co_quan, "fact_van_hanh_co_quan")
 
-def spark_table_with_alias(spark: SparkSession, table: str, alias: str) -> DataFrame:
-    """Small helper keeping joins readable without relying on SQL strings."""
-    return spark.table(table).alias(alias)
-
-
-def overwrite_partition(spark: SparkSession, table: str, date_key: int, dataframe: DataFrame) -> None:
-    """Idempotently replace exactly one reporting-date partition."""
-    spark.sql(f"DELETE FROM {table} WHERE thoi_gian_id = {date_key}")
-    dataframe.writeTo(table).append()
-
-
-def main() -> None:
-    args = parse_args()
-    as_of_date: date = args.as_of_date
-    cutoff_ts = f"{as_of_date.isoformat()} 23:59:59"
-    spark = build_spark()
-    spark.sparkContext.setLogLevel("WARN")
-    try:
-        ensure_fact_tables(spark)
-        require_tables(spark, [SILVER_EVENTS, SILVER_HISTORY, SILVER_PAYMENT, DIM_TIME, DIM_STATUS, DIM_SERVICE])
-
-        calendar, as_of_calendar = build_calendar(spark, as_of_date)
-        events = spark.table(SILVER_EVENTS)
-        history = spark.table(SILVER_HISTORY).filter(F.col("action_time") <= F.lit(cutoff_ts).cast("timestamp"))
-        payments = spark.table(SILVER_PAYMENT).filter(F.col("paid_at") <= F.lit(cutoff_ts).cast("timestamp"))
-        applications = latest_application_as_of(events, cutoff_ts)
-
-        latest_history_window = Window.partitionBy("ho_so_id").orderBy(
-            F.col("action_time").desc_nulls_last(), F.col("history_id").desc()
-        )
-        last_history = (
-            history.withColumn("_last_history_rank", F.row_number().over(latest_history_window))
-            .filter(F.col("_last_history_rank") == 1)
-            .select(
-                "ho_so_id",
-                F.col("can_bo_id").alias("last_can_bo_id"),
-                F.col("action_time").alias("last_action_time"),
-            )
-        )
-        status = spark.table(DIM_STATUS).select("trang_thai_id", "ma_trang_thai")
-        service_sla = spark.table(DIM_SERVICE).select(
-            F.col("dv_cong_id").alias("sla_dv_cong_id"),
-            F.col("thoi_han_tra_kq_ngay").cast("int").alias("sla_ngay"),
-        )
-        application_state = (
-            applications.join(last_history, "ho_so_id", "left")
-            .join(status, "trang_thai_id", "left")
-            .join(service_sla, F.col("dv_cong_id") == F.col("sla_dv_cong_id"), "left")
-            .withColumn("can_bo_id", F.coalesce("last_can_bo_id", F.lit(-1)).cast("int"))
-            .withColumn("last_action_time", F.coalesce("last_action_time", "created_at"))
-        )
-        aged_state = add_business_age(application_state, calendar, as_of_calendar)
-        date_key = int(as_of_date.strftime("%Y%m%d"))
-
-        # Fact 1: exact day-end inventory, excluding both terminal outcomes.
-        backlog = (
-            aged_state.filter(~F.col("ma_trang_thai").isin("COMPLETED", "REJECTED"))
-            .select(
-                F.sha2(F.concat_ws("|", F.lit(str(date_key)), "ho_so_id"), 256).alias("id"),
-                "ho_so_id",
-                "trang_thai_id",
-                "co_quan_id",
-                "can_bo_id",
-                "dv_cong_id",
-                F.col("so_ngay_ton_dong_hien_tai").cast("int"),
-                F.col("tong_thoi_gian_da_xu_ly").cast("int"),
-                F.lit(1).cast("int").alias("so_luong"),
-                F.lit(date_key).cast("int").alias("thoi_gian_id"),
-            )
-            .repartition("co_quan_id")
-        )
-        overwrite_partition(spark, FACT_BACKLOG, date_key, backlog)
-
-        # Daily flow measures. REJECTED is used as the actual supplied-data
-        # rework signal: the source has no separate PENDING/BOSUNG status.
-        received = (
-            applications.filter(F.to_date("created_at") == F.lit(as_of_date.isoformat()).cast("date"))
-            .groupBy("co_quan_id")
-            .agg(F.countDistinct("ho_so_id").cast("int").alias("so_luong_tiep_nhan"))
-        )
-        rework = (
-            history.filter(F.to_date("action_time") == F.lit(as_of_date.isoformat()).cast("date"))
-            .join(status, "trang_thai_id", "left")
-            .filter(F.col("ma_trang_thai") == F.lit("REJECTED"))
-            .join(applications.select("ho_so_id", "co_quan_id"), "ho_so_id", "inner")
-            .groupBy("co_quan_id")
-            .agg(F.countDistinct("ho_so_id").cast("int").alias("so_luong_rework"))
-        )
-        revenue = (
-            payments.filter(
-                (F.to_date("paid_at") == F.lit(as_of_date.isoformat()).cast("date"))
-                & (F.col("payment_status") == F.lit("SUCCESS"))
-            )
-            .join(applications.select("ho_so_id", "co_quan_id"), "ho_so_id", "inner")
-            .groupBy("co_quan_id")
-            .agg(F.coalesce(F.sum("so_tien"), F.lit(0)).cast("bigint").alias("tong_chi_phi"))
-        )
-        backlog_metrics = backlog.groupBy("co_quan_id").agg(F.sum("so_luong").cast("int").alias("so_luong_ton_dong"))
-        # The leadership overdue KPI includes both completed-late applications
-        # and applications that are still open but have already exceeded SLA.
-        overdue_open = (
-            aged_state.filter(
-                ~F.col("ma_trang_thai").isin("COMPLETED", "REJECTED")
-                & (F.col("tong_thoi_gian_da_xu_ly") > F.coalesce(F.col("sla_ngay"), F.lit(0)))
-            )
-            .groupBy("co_quan_id")
-            .agg(F.countDistinct("ho_so_id").cast("int").alias("so_luong_tre_han_dang_mo"))
-        )
-        completed = completed_metrics(history, applications, calendar, as_of_date)
-
-        agency_keys = (
-            received.select("co_quan_id")
-            .unionByName(rework.select("co_quan_id"))
-            .unionByName(revenue.select("co_quan_id"))
-            .unionByName(backlog_metrics.select("co_quan_id"))
-            .unionByName(overdue_open.select("co_quan_id"))
-            .unionByName(completed.select("co_quan_id"))
-            .filter(F.col("co_quan_id").isNotNull())
-            .dropDuplicates()
-        )
-        agency_fact = (
-            agency_keys.join(received, "co_quan_id", "left")
-            .join(completed, "co_quan_id", "left")
-            .join(rework, "co_quan_id", "left")
-            .join(backlog_metrics, "co_quan_id", "left")
-            .join(overdue_open, "co_quan_id", "left")
-            .join(revenue, "co_quan_id", "left")
-            .fillna(
-                0,
-                [
-                    "so_luong_tiep_nhan",
-                    "so_luong_dung_han",
-                    "so_luong_tre_han",
-                    "so_luong_tre_han_dang_mo",
-                    "so_luong_rework",
-                    "so_luong_ton_dong",
-                    "tong_chi_phi",
-                ],
-            )
-            .select(
-                F.concat_ws("|", F.lit(str(date_key)), F.col("co_quan_id").cast("string")).alias("id"),
-                F.col("co_quan_id").cast("int"),
-                F.col("so_luong_tiep_nhan").cast("int"),
-                F.col("so_luong_dung_han").cast("int"),
-                (F.col("so_luong_tre_han") + F.col("so_luong_tre_han_dang_mo")).cast("int").alias("so_luong_tre_han"),
-                F.col("so_luong_rework").cast("int"),
-                F.col("so_luong_ton_dong").cast("int"),
-                F.col("tong_chi_phi").cast("bigint"),
-                F.lit(date_key).cast("int").alias("thoi_gian_id"),
-            )
-            .repartition("co_quan_id")
-        )
-        overwrite_partition(spark, FACT_AGENCY, date_key, agency_fact)
-    finally:
-        spark.stop()
-
-
-if __name__ == "__main__":
-    main()
+fact_ton_dong_ho_so.unpersist()
+print("[+] Hoan tat Silver -> Gold.")
+spark.stop()

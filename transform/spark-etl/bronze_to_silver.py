@@ -1,406 +1,446 @@
-"""Build typed, deduplicated Silver entities from the immutable XML Bronze log.
-
-The XML ingestion job intentionally stores ``du_lieu`` as JSON text in
-``lakehouse.bronze_dvc_xml.application_xml``.  This job does not change that
-ingestion contract.  It only parses the JSON, applies the event ordering, and
-creates four reusable Silver tables:
-
-* application_events   -- one typed XML packet per ma_goi_tin;
-* application_current  -- latest non-deleted application state;
-* application_history  -- one status-transition event per history ID;
-* payment               -- one latest version per payment ID.
-
-The supplied archive mixes full and partial XML packets.  ``last(...,
-ignorenulls=True)`` is therefore essential: a partial status update must not
-erase the service, agency, or submitted timestamp received in the INSERT.
-"""
+# ============================================================================
+# JOB: Bronze -> Silver
+# File : transform/spark-etl/bronze_to_silver.py
+# Phu trach: Quan (DE)  |  Lich chay: dag_transform (Airflow), sau ingestion
+#
+# MUC DICH
+#   Ho so cong duoc nap vao Bronze qua 2 kenh SONG SONG khong dong bo voi nhau:
+#     (1) Kenh XML (Landing Zone -> job2) : bronze_dvc_xml.application_xml
+#     (2) Kenh CDC (Debezium/Kafka -> job3): bronze_oltp_core.*_cdc
+#   Job nay HOP NHAT ca 2 kenh thanh 1 ban ghi "single source of truth" duy
+#   nhat cho tung thuc the (ho so, lich su xu ly, tai lieu, thanh toan...),
+#   dong thoi lam sach danh muc (master data).
+#
+# CAC BANG SILVER TAO RA (namespace lakehouse.silver)
+#   - application            : trang thai HIEN TAI cua tung ho so (1 dong/ho_so_id)
+#   - application_history    : nhat ky xu ly, append-only (1 dong/hanh dong)
+#   - document               : tai lieu dinh kem HIEN TAI cua ho so
+#   - payment                : giao dich thanh toan (hop nhat kenh XML + API)
+#   - applicant               : cong dan nop ho so (tu CDC)
+#   - province/ward/status/service/agency/role/permission/document_type/
+#     officer/officer_role    : ban sao lam sach cua 10 bang danh muc Bronze
+#
+# LUU Y QUAN TRONG VE DEDUP (day la diem de sai nhat neu lam vay)
+#   Kenh XML co the gui UPDATE dang "PARTIAL_STATUS" - CHI mang theo 1 cot
+#   Statusid, cac cot con lai (name, Applicantid...) la NULL. Neu dedup kieu
+#   dropDuplicates(["ho_so_id"]) hoac lay row_number don gian theo thoi gian,
+#   ta se VO TINH lay phai 1 dong PARTIAL va lam mat du lieu cac cot khac.
+#   => Giai phap: "forward-fill" tung cot (last non-null value) theo thu tu
+#   thoi gian TRUOC, sau do moi chon dong moi nhat. Da kiem chung bang du
+#   lieu XML mau that (xem phan mo ta ket qua kem theo).
+#
+# THIET KE TRANH OOM
+#   - Khong dung .collect()/.toPandas() tren du lieu lon
+#   - repartition() theo khoa nghiep vu (ho_so_id) TRUOC khi lam Window de
+#     moi executor chi xu ly du lieu cua 1 nhom ho_so_id, tranh 1 partition
+#     phai gom qua nhieu du lieu (data skew) gay OOM
+#   - AQE (Adaptive Query Execution) bat san: Spark tu dong gop/tach lai
+#     partition va tu xu ly skew join khi runtime phat hien lech du lieu
+#   - Chi select() dung cot can thiet ngay tu buoc doc Bronze (column pruning)
+#
+# Y NGHIA "OVERWRITE" O DAY
+#   Voi quy mo du lieu hien tai (vai chuc - vai tram nghin dong), job nay
+#   TINH LAI TOAN BO Silver tu Bronze moi lan chay (mode=overwrite) de dam
+#   bao idempotent (chay lai bao nhieu lan cung ra 1 ket qua). Khi du lieu
+#   len den muc hang trieu/ty dong, nen chuyen sang MERGE INTO ... WHEN
+#   MATCHED/NOT MATCHED chi voi phan Bronze moi nap theo watermark
+#   (ingested_at > lan chay truoc) de tranh quet lai toan bo lich su.
+# ============================================================================
 
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
-from pyspark.sql.types import ArrayType, IntegerType, LongType, StringType, StructField, StructType, TimestampType
+from pyspark.sql.types import ArrayType, DoubleType, StringType, StructField, StructType, TimestampType
+
+# ---------------------------------------------------------------------------
+# 1. SPARK SESSION - dong bo config voi ingestion/job1..job4 (Iceberg + MinIO)
+# ---------------------------------------------------------------------------
+MINIO_ENDPOINT = "http://minio:9000"
+MINIO_ACCESS_KEY = "minio_access_key"
+MINIO_SECRET_KEY = "minio_secret_key"
+ICEBERG_WAREHOUSE = "s3a://lakehouse/warehouse/"
+CATALOG = "lakehouse"
+
+spark = (
+    SparkSession.builder
+    .appName("Transform_BronzeToSilver")
+    .config("spark.hadoop.fs.s3a.endpoint", MINIO_ENDPOINT)
+    .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY)
+    .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY)
+    .config("spark.hadoop.fs.s3a.path.style.access", "true")
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config(f"spark.sql.catalog.{CATALOG}", "org.apache.iceberg.spark.SparkCatalog")
+    .config(f"spark.sql.catalog.{CATALOG}.type", "hive")
+    .config(f"spark.sql.catalog.{CATALOG}.uri", "thrift://hive-metastore:9083")
+    .config(f"spark.sql.catalog.{CATALOG}.warehouse", ICEBERG_WAREHOUSE)
+    # --- Chong OOM: AQE tu dong gop/tach partition + xu ly skew join ---
+    .config("spark.sql.adaptive.enabled", "true")
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+    .config("spark.sql.adaptive.skewJoin.enabled", "true")
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.silver")
+
+N_PART = 32  # so partition muc tieu khi repartition theo khoa nghiep vu (ho_so_id)
 
 
-BRONZE_APPLICATION_XML = "lakehouse.bronze_dvc_xml.application_xml"
-BRONZE_APPLICATION_CDC = "lakehouse.bronze_oltp_core.application_cdc"
-BRONZE_HISTORY_CDC = "lakehouse.bronze_oltp_core.application_history_cdc"
-BRONZE_API_PAYMENT = "lakehouse.bronze_api.payment_transactions"
-SILVER_EVENTS = "lakehouse.silver.application_events"
-SILVER_CURRENT = "lakehouse.silver.application_current"
-SILVER_HISTORY = "lakehouse.silver.application_history"
-SILVER_PAYMENT = "lakehouse.silver.payment"
-
-
-def build_spark() -> SparkSession:
-    """Return the same Iceberg/Hive/MinIO catalog used by the ingestion jobs."""
-    return (
-        SparkSession.builder.appName("bronze-to-silver-dvc")
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-        .config("spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.lakehouse.type", "hive")
-        .config("spark.sql.catalog.lakehouse.uri", "thrift://hive-metastore:9083")
-        .config("spark.sql.catalog.lakehouse.warehouse", "s3a://lakehouse/warehouse/")
-        .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000")
-        .config("spark.hadoop.fs.s3a.access.key", "minio_access_key")
-        .config("spark.hadoop.fs.s3a.secret.key", "minio_secret_key")
-        .config("spark.hadoop.fs.s3a.path.style.access", "true")
-        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-        .config("spark.sql.session.timeZone", "Asia/Ho_Chi_Minh")
-        .config("spark.sql.adaptive.enabled", "true")
-        .getOrCreate()
-    )
-
-
-def ensure_silver_tables(spark: SparkSession) -> None:
-    """Create stable schemas before writing, so a malformed source cannot drift them."""
-    spark.sql("CREATE NAMESPACE IF NOT EXISTS lakehouse.silver")
-    spark.sql(
-        f"""
-        CREATE TABLE IF NOT EXISTS {SILVER_EVENTS} (
-            ma_goi_tin STRING, ho_so_id STRING, su_kien STRING, event_ts TIMESTAMP,
-            ten_ho_so STRING, nguoi_nop_id STRING, dv_cong_id INT, co_quan_id INT,
-            created_at TIMESTAMP, trang_thai_id INT, file_name STRING, ingested_at TIMESTAMP,
-            processed_at TIMESTAMP
-        ) USING iceberg PARTITIONED BY (days(event_ts))
-        """
-    )
-    spark.sql(
-        f"""
-        CREATE TABLE IF NOT EXISTS {SILVER_CURRENT} (
-            ho_so_id STRING, ten_ho_so STRING, nguoi_nop_id STRING, dv_cong_id INT,
-            co_quan_id INT, created_at TIMESTAMP, trang_thai_id INT, event_ts TIMESTAMP,
-            is_deleted BOOLEAN, processed_at TIMESTAMP
-        ) USING iceberg
-        """
-    )
-    spark.sql(
-        f"""
-        CREATE TABLE IF NOT EXISTS {SILVER_HISTORY} (
-            history_id STRING, ho_so_id STRING, trang_thai_truoc_id INT,
-            trang_thai_id INT, can_bo_id INT, action_time TIMESTAMP, ghi_chu STRING,
-            event_ts TIMESTAMP, ma_goi_tin STRING, processed_at TIMESTAMP
-        ) USING iceberg PARTITIONED BY (days(action_time))
-        """
-    )
-    spark.sql(
-        f"""
-        CREATE TABLE IF NOT EXISTS {SILVER_PAYMENT} (
-            payment_id STRING, ho_so_id STRING, so_tien BIGINT, phuong_thuc STRING,
-            payment_status STRING, ma_giao_dich STRING, paid_at TIMESTAMP, event_ts TIMESTAMP,
-            ma_goi_tin STRING, processed_at TIMESTAMP
-        ) USING iceberg PARTITIONED BY (days(paid_at))
-        """
-    )
-
-
-def overwrite_table(df, table_name: str) -> None:
-    """Rebuild a derived Silver table deterministically from the append-only Bronze log."""
-    df.writeTo(table_name).overwrite(F.lit(True))
-
-
-def as_json_array(json_column):
-    """Normalise an object-or-array XML representation to a JSON array string."""
-    trimmed = F.trim(json_column)
-    return F.when(
-        json_column.isNull() | (trimmed == "") | (trimmed == "null"),
-        F.lit(None).cast("string"),
-    ).when(
-        trimmed.startswith("["), json_column
-    ).otherwise(F.concat(F.lit("["), json_column, F.lit("]")))
-
-
-def build_application_events(bronze):
-    """Type the top-level application attributes and remove duplicated packets."""
-    events = (
-        bronze.select(
-            "ma_goi_tin",
-            F.col("id_ban_ghi").cast("string").alias("ho_so_id"),
-            F.upper(F.trim("su_kien")).alias("su_kien"),
-            F.coalesce(
-                F.to_timestamp("ngay_cap_nhat", "yyyy-MM-dd HH:mm:ss"),
-                F.to_timestamp(F.get_json_object("data_payload", "$.created_at"), "yyyy-MM-dd HH:mm:ss"),
-            ).alias("event_ts"),
-            F.get_json_object("data_payload", "$.name").alias("ten_ho_so"),
-            F.get_json_object("data_payload", "$.Applicantid").alias("nguoi_nop_id"),
-            F.get_json_object("data_payload", "$.Serviceid").cast(IntegerType()).alias("dv_cong_id"),
-            F.get_json_object("data_payload", "$.Agencyid").cast(IntegerType()).alias("co_quan_id"),
-            F.to_timestamp(F.get_json_object("data_payload", "$.created_at"), "yyyy-MM-dd HH:mm:ss").alias("created_at"),
-            F.get_json_object("data_payload", "$.Statusid").cast(IntegerType()).alias("trang_thai_id"),
-            "data_payload",
-            "file_name",
-            "ingested_at",
-        )
-        .filter(F.col("ma_goi_tin").isNotNull() & F.col("ho_so_id").isNotNull())
-    )
-    duplicate_window = Window.partitionBy("ma_goi_tin").orderBy(F.col("ingested_at").desc_nulls_last())
-    return (
-        events.withColumn("_packet_rank", F.row_number().over(duplicate_window))
-        .filter(F.col("_packet_rank") == 1)
-        .drop("_packet_rank")
-        .withColumn("processed_at", F.current_timestamp())
-    )
-
-
-def build_cdc_application_events(spark: SparkSession):
-    """Adapt the existing Spark-CDC Bronze table to the canonical event schema.
-
-    The current ingestion job only writes c/u records to Iceberg. Deletes are
-    handled correctly by the dedicated StarRocks CDC path, while this adapter
-    lets the batch mart also include the CDC application stream when it exists.
+def save_silver(df, table_name, partition_cols=None):
+    """Ham dung chung: tao bang Iceberg neu chua co (theo dung mau CREATE TABLE
+    IF NOT EXISTS ma job1/job2/job4 dang dung de dong bo phong cach code trong
+    repo), roi ghi de (overwrite) toan bo du lieu.
     """
-    if not spark.catalog.tableExists(BRONZE_APPLICATION_CDC):
-        return None
-    cdc = spark.table(BRONZE_APPLICATION_CDC)
-    event_ts = F.coalesce(F.col("updated_at").cast("timestamp"), F.col("created_at").cast("timestamp"), F.col("ingested_at"))
-    return cdc.select(
-        F.concat_ws("|", F.lit("cdc-app"), F.col("id"), event_ts.cast("string"), F.col("op")).alias("ma_goi_tin"),
-        F.col("id").cast("string").alias("ho_so_id"),
-        F.when(F.col("op") == F.lit("d"), F.lit("DELETE"))
-        .when(F.col("op").isin("c", "r"), F.lit("INSERT"))
-        .otherwise(F.lit("UPDATE"))
-        .alias("su_kien"),
-        event_ts.alias("event_ts"),
+    full_name = f"{CATALOG}.silver.{table_name}"
+    schema_sql = ", ".join(f"`{f.name}` {f.dataType.simpleString()}" for f in df.schema.fields)
+    part_clause = f"PARTITIONED BY ({', '.join(partition_cols)})" if partition_cols else ""
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {full_name} ({schema_sql})
+        USING iceberg
+        {part_clause}
+        LOCATION 's3a://lakehouse/warehouse/silver/{table_name}'
+    """)
+    df.write.format("iceberg").mode("overwrite").save(full_name)
+    print(f"[+] silver.{table_name} <- da ghi xong")
+
+
+def read_optional_bronze(table_name, schema):
+    """Doc nguon Bronze neu da duoc ingest, nguoc lai tra DataFrame rong.
+
+    XML va API la hai kenh batch co the chua co file trong mot lan demo. Silver
+    van phai chay duoc voi CDC, thay vi fail ngay khi bang Bronze chua duoc tao.
+    Schema rong giu unionByName va schema Gold on dinh.
+    """
+    if spark.catalog.tableExists(table_name):
+        return spark.table(table_name)
+    print(f"[!] Khong tim thay {table_name}; su dung DataFrame rong cho lan chay nay.")
+    return spark.createDataFrame([], schema)
+
+
+BRONZE_XML_TABLE = f"{CATALOG}.bronze_dvc_xml.application_xml"
+BRONZE_API_TABLE = f"{CATALOG}.bronze_api.payment_transactions"
+
+bronze_xml = read_optional_bronze(
+    BRONZE_XML_TABLE,
+    StructType([
+        StructField("ma_goi_tin", StringType()),
+        StructField("ma_du_lieu", StringType()),
+        StructField("loai_du_lieu", StringType()),
+        StructField("ngay_cap_nhat", StringType()),
+        StructField("su_kien", StringType()),
+        StructField("id_ban_ghi", StringType()),
+        StructField("data_payload", StringType()),
+        StructField("file_name", StringType()),
+        StructField("ingested_at", TimestampType()),
+    ]),
+)
+bronze_api_payments = read_optional_bronze(
+    BRONZE_API_TABLE,
+    StructType([
+        StructField("id_ban_ghi", StringType()),
+        StructField("payment_status", StringType()),
+        StructField("tax_code", StringType()),
+        StructField("amount", DoubleType()),
+        StructField("method", StringType()),
+        StructField("timestamp", StringType()),
+        StructField("file_name", StringType()),
+        StructField("ingested_at", TimestampType()),
+    ]),
+)
+
+
+# ---------------------------------------------------------------------------
+# 2. DANH MUC (MASTER DATA) - 10 bang, chi lam sach/chuan hoa
+#    (Bronze da duoc job1 OVERWRITE toan bo moi lan chay nen khong co van
+#    de "ban ghi cu/moi" can dedup theo thoi gian o day)
+# ---------------------------------------------------------------------------
+MASTER_TABLES = [
+    "province", "ward", "status", "service", "agency",
+    "role", "permission", "document_type", "officer", "officer_role",
+]
+
+for t in MASTER_TABLES:
+    df = spark.table(f"{CATALOG}.bronze_master_data.{t}")
+    string_cols = [f.name for f in df.schema.fields if f.dataType.simpleString() == "string"]
+    for c in string_cols:
+        df = df.withColumn(c, F.trim(F.col(c)))
+    drop_cols = [c for c in ("ingested_at", "file_name") if c in df.columns]
+    if drop_cols:
+        df = df.drop(*drop_cols)
+    df = df.dropDuplicates()
+    save_silver(df, t)
+
+
+# ---------------------------------------------------------------------------
+# 3. SILVER.APPLICATION - hop nhat kenh XML (packet) + kenh CDC (Debezium)
+#    Xem ghi chu forward-fill o dau file.
+# ---------------------------------------------------------------------------
+app_payload_schema = StructType([
+    StructField("name", StringType()),
+    StructField("Applicantid", StringType()),
+    StructField("Serviceid", StringType()),
+    StructField("Agencyid", StringType()),
+    StructField("created_at", StringType()),
+    StructField("Statusid", StringType()),
+])
+
+# 3.1 Kenh XML: moi packet la 1 "quan sat" tai 1 thoi diem (co the la FULL
+#     hoac chi PARTIAL_STATUS), ngay_cap_nhat la moc thoi gian cua quan sat do
+xml_app_events = (
+    bronze_xml
+    .withColumn("p", F.from_json("data_payload", app_payload_schema))
+    .select(
+        F.col("id_ban_ghi").alias("ho_so_id"),
+        F.col("p.name").alias("ten_ho_so"),
+        F.col("p.Applicantid").alias("applicant_id"),
+        F.col("p.Serviceid").cast("int").alias("dv_cong_id"),
+        F.col("p.Agencyid").cast("int").alias("co_quan_id"),
+        F.to_timestamp("p.created_at").alias("created_at"),
+        F.col("p.Statusid").cast("int").alias("trang_thai_id"),
+        # ngay_cap_nhat la event time nghiep vu. Fallback ingested_at giu cho
+        # window co thu tu xac dinh neu packet XML bi thieu/loi timestamp.
+        F.coalesce(F.to_timestamp("ngay_cap_nhat"), F.col("ingested_at")).alias("event_time"),
+        (F.col("su_kien") == F.lit("DELETE")).alias("is_deleted_event"),
+        F.lit(1).alias("source_priority"),  # CDC thang XML neu trung event_time
+    )
+)
+
+# 3.2 Kenh CDC: da co cau truc san, moi dong la 1 quan sat tai thoi diem updated_at
+cdc_app_events = (
+    spark.table(f"{CATALOG}.bronze_oltp_core.application_cdc")
+    .select(
+        F.col("id").alias("ho_so_id"),
         F.col("name").alias("ten_ho_so"),
-        F.col("Applicantid").cast("string").alias("nguoi_nop_id"),
-        F.col("Serviceid").cast(IntegerType()).alias("dv_cong_id"),
-        F.col("Agencyid").cast(IntegerType()).alias("co_quan_id"),
-        F.col("created_at").cast("timestamp").alias("created_at"),
-        F.col("Statusid").cast(IntegerType()).alias("trang_thai_id"),
-        F.lit(None).cast("string").alias("data_payload"),
-        F.lit("kafka-cdc").alias("file_name"),
-        F.col("ingested_at").cast("timestamp").alias("ingested_at"),
-        F.current_timestamp().alias("processed_at"),
-    ).filter(F.col("ho_so_id").isNotNull())
+        F.col("Applicantid").alias("applicant_id"),
+        F.col("Serviceid").alias("dv_cong_id"),
+        F.col("Agencyid").alias("co_quan_id"),
+        F.col("created_at"),
+        F.col("Statusid").alias("trang_thai_id"),
+        F.coalesce(F.col("updated_at"), F.col("ingested_at")).alias("event_time"),
+        F.lit(False).alias("is_deleted_event"),
+        F.lit(2).alias("source_priority"),
+    )
+)
+
+application_events = (
+    xml_app_events.unionByName(cdc_app_events)
+    .repartition(N_PART, "ho_so_id")   # chong data skew truoc khi Window
+)
+
+w_forward = (
+    Window.partitionBy("ho_so_id").orderBy("event_time", "source_priority")
+    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+)
+for c in ["ten_ho_so", "applicant_id", "dv_cong_id", "co_quan_id", "created_at", "trang_thai_id"]:
+    application_events = application_events.withColumn(c, F.last(c, ignorenulls=True).over(w_forward))
+
+w_latest_app = Window.partitionBy("ho_so_id").orderBy(
+    F.col("event_time").desc(), F.col("source_priority").desc()
+)
+silver_application = (
+    application_events
+    .withColumn("rn", F.row_number().over(w_latest_app))
+    .filter("rn = 1")
+    .drop("rn")
+    .drop("source_priority")
+    .withColumnRenamed("is_deleted_event", "da_bi_xoa")
+    .withColumn("cap_nhat_luc", F.current_timestamp())
+)
+
+save_silver(silver_application, "application")
 
 
-def build_cdc_history(spark: SparkSession):
-    """Adapt Debezium history Bronze rows when the batch CDC job has run."""
-    if not spark.catalog.tableExists(BRONZE_HISTORY_CDC):
-        return None
-    cdc = spark.table(BRONZE_HISTORY_CDC)
-    return (
-        cdc.select(
-            F.col("id").cast("string").alias("history_id"),
-            F.col("Applicationid").cast("string").alias("ho_so_id"),
-            F.col("Statusid").cast(IntegerType()).alias("trang_thai_truoc_id"),
-            F.col("Statusid2").cast(IntegerType()).alias("trang_thai_id"),
-            F.col("Officerid").cast(IntegerType()).alias("can_bo_id"),
-            F.col("action_time").cast("timestamp").alias("action_time"),
-            F.col("note").alias("ghi_chu"),
-            F.coalesce(F.col("action_time").cast("timestamp"), F.col("ingested_at")).alias("event_ts"),
-            F.concat_ws("|", F.lit("cdc-history"), F.col("id")).alias("ma_goi_tin"),
-            F.current_timestamp().alias("processed_at"),
-        )
-        .filter(F.col("history_id").isNotNull() & F.col("ho_so_id").isNotNull())
+# ---------------------------------------------------------------------------
+# 4. SILVER.APPLICATION_HISTORY - nhat ky xu ly, append-only, bat bien
+#    Grain = 1 dong = 1 hanh dong xu ly = 1 ban ghi Application_History goc.
+#    Day la nguon truc tiep cho fact_xu_ly_ho_so (streaming, StarRocks) va
+#    cho can_bo_id "dang giu" ho so trong fact_ton_dong_ho_so (ben duoi).
+# ---------------------------------------------------------------------------
+history_array_schema = ArrayType(StructType([
+    StructField("id", StringType()),
+    StructField("Statusid", StringType()),
+    StructField("Statusid2", StringType()),
+    StructField("Officerid", StringType()),
+    StructField("action_time", StringType()),
+]))
+
+xml_history = (
+    bronze_xml
+    .withColumn(
+        "p",
+        F.from_json("data_payload", StructType([
+            StructField("application_history_array", history_array_schema)
+        ])),
     )
+    .filter(F.col("p.application_history_array").isNotNull())
+    .select(F.col("id_ban_ghi").alias("ho_so_id"), F.explode("p.application_history_array").alias("h"))
+    .select(
+        F.col("h.id").alias("history_id"),
+        F.col("ho_so_id"),
+        F.col("h.Statusid").cast("int").alias("trang_thai_truoc_id"),
+        F.col("h.Statusid2").cast("int").alias("trang_thai_id"),
+        F.col("h.Officerid").cast("int").alias("can_bo_id"),
+        F.to_timestamp("h.action_time").alias("action_time"),
+        F.lit(None).cast("string").alias("note"),
+    )
+)
+
+cdc_history = (
+    spark.table(f"{CATALOG}.bronze_oltp_core.application_history_cdc")
+    .select(
+        F.col("id").alias("history_id"),
+        F.col("Applicationid").alias("ho_so_id"),
+        F.col("Statusid").alias("trang_thai_truoc_id"),
+        F.col("Statusid2").alias("trang_thai_id"),
+        F.col("Officerid").alias("can_bo_id"),
+        F.col("action_time"),
+        F.col("note"),
+    )
+)
+
+# Khu trung theo history_id: cung 1 su kien co the "nhin thay" qua ca 2 kenh
+# trong moi truong demo nay (XML resend + CDC). Ly thuyet 2 ban phai giong
+# nhau, chi giu 1 ban de tranh nhan doi khi tinh trung binh/dem so luong.
+w_hist = Window.partitionBy("history_id").orderBy(F.col("action_time").desc())
+silver_application_history = (
+    xml_history.unionByName(cdc_history)
+    .repartition(N_PART, "ho_so_id")
+    .withColumn("rn", F.row_number().over(w_hist))
+    .filter("rn = 1")
+    .drop("rn")
+    # -1 = Unknown, dung theo dung luu y trong data-dictionary.md de tranh
+    # JOIN rong khi ho so moi RECEIVED chua duoc phan cong can bo
+    .withColumn("can_bo_id", F.coalesce(F.col("can_bo_id"), F.lit(-1)))
+)
+
+save_silver(silver_application_history, "application_history")
 
 
-def build_history(events):
-    """Explode the status-history payload, handling both one-object and array packets."""
-    history_schema = ArrayType(
-        StructType(
-            [
-                StructField("id", StringType(), True),
-                StructField("Statusid", StringType(), True),
-                StructField("Statusid2", StringType(), True),
-                StructField("Officerid", StringType(), True),
-                StructField("action_time", StringType(), True),
-                StructField("note", StringType(), True),
-            ]
-        )
-    )
-    history_json = F.get_json_object("data_payload", "$.application_history_array.application_history")
-    exploded = (
-        events.withColumn("_history", F.from_json(as_json_array(history_json), history_schema))
-        .select("ho_so_id", "event_ts", "ma_goi_tin", F.explode_outer("_history").alias("history"))
-        .select(
-            F.col("history.id").cast("string").alias("history_id"),
-            "ho_so_id",
-            F.col("history.Statusid").cast(IntegerType()).alias("trang_thai_truoc_id"),
-            F.col("history.Statusid2").cast(IntegerType()).alias("trang_thai_id"),
-            F.col("history.Officerid").cast(IntegerType()).alias("can_bo_id"),
-            F.to_timestamp("history.action_time", "yyyy-MM-dd HH:mm:ss").alias("action_time"),
-            F.col("history.note").alias("ghi_chu"),
-            "event_ts",
-            "ma_goi_tin",
-        )
-        .filter(F.col("history_id").isNotNull())
-    )
-    dedup_window = Window.partitionBy("history_id").orderBy(
-        F.col("event_ts").desc_nulls_last(), F.col("ma_goi_tin").desc()
-    )
-    return (
-        exploded.withColumn("_history_rank", F.row_number().over(dedup_window))
-        .filter(F.col("_history_rank") == 1)
-        .drop("_history_rank")
-        .withColumn("action_time", F.coalesce("action_time", "event_ts"))
-        .withColumn("processed_at", F.current_timestamp())
-    )
+# ---------------------------------------------------------------------------
+# 5. SILVER.DOCUMENT - tai lieu dinh kem HIEN TAI (last write wins theo id)
+# ---------------------------------------------------------------------------
+doc_item_schema = StructType([
+    StructField("id", StringType()),
+    StructField("name", StringType()),
+    StructField("file_url", StringType()),
+    StructField("Document_Typeid", StringType()),
+])
 
-
-def build_payments(events):
-    """Explode payment additions/full snapshots and keep the latest version of a payment."""
-    payment_schema = ArrayType(
-        StructType(
-            [
-                StructField("id", StringType(), True),
-                StructField("amount", StringType(), True),
-                StructField("method", StringType(), True),
-                StructField("status", StringType(), True),
-                StructField("transaction_code", StringType(), True),
-                StructField("paid_at", StringType(), True),
-            ]
-        )
-    )
-    payment_json = F.get_json_object("data_payload", "$.payment_array.payment")
-    exploded = (
-        events.withColumn("_payment", F.from_json(as_json_array(payment_json), payment_schema))
-        .select("ho_so_id", "event_ts", "ma_goi_tin", F.explode_outer("_payment").alias("payment"))
-        .select(
-            F.col("payment.id").cast("string").alias("payment_id"),
-            "ho_so_id",
-            F.col("payment.amount").cast(LongType()).alias("so_tien"),
-            F.col("payment.method").alias("phuong_thuc"),
-            F.upper(F.col("payment.status")).alias("payment_status"),
-            F.col("payment.transaction_code").alias("ma_giao_dich"),
-            F.to_timestamp("payment.paid_at", "yyyy-MM-dd HH:mm:ss").alias("paid_at"),
-            "event_ts",
-            "ma_goi_tin",
-        )
-        .filter(F.col("payment_id").isNotNull())
-    )
-    dedup_window = Window.partitionBy("payment_id").orderBy(
-        F.col("event_ts").desc_nulls_last(), F.col("ma_goi_tin").desc()
-    )
-    return (
-        exploded.withColumn("_payment_rank", F.row_number().over(dedup_window))
-        .filter(F.col("_payment_rank") == 1)
-        .drop("_payment_rank")
-        .withColumn("paid_at", F.coalesce("paid_at", "event_ts"))
-        .withColumn("processed_at", F.current_timestamp())
-    )
-
-
-def build_api_payments(spark: SparkSession):
-    """Bring the existing NiFi/API Bronze feed into the canonical payment entity."""
-    if not spark.catalog.tableExists(BRONZE_API_PAYMENT):
-        return None
-    api = spark.table(BRONZE_API_PAYMENT)
-    paid_at = F.to_timestamp("timestamp", "yyyy-MM-dd HH:mm:ss")
-    # The mock API has no transaction ID. This deterministic natural key is the
-    # safest available deduplication key without changing ingestion.
-    payment_id = F.sha2(
-        F.concat_ws(
-            "|",
-            F.lit("api"),
-            F.col("id_ban_ghi"),
-            F.col("timestamp"),
-            F.col("amount").cast("string"),
-            F.col("method"),
-            F.col("tax_code"),
+xml_docs = (
+    bronze_xml
+    .withColumn(
+        "p",
+        F.from_json(
+            "data_payload",
+            StructType([StructField("document_array", ArrayType(doc_item_schema))]),
         ),
-        256,
     )
-    return api.select(
-        payment_id.alias("payment_id"),
-        F.col("id_ban_ghi").cast("string").alias("ho_so_id"),
-        F.col("amount").cast(LongType()).alias("so_tien"),
+    .filter(F.col("p.document_array").isNotNull())
+    .select(F.col("id_ban_ghi").alias("ho_so_id"), F.to_timestamp("ngay_cap_nhat").alias("event_time"),
+            F.explode("p.document_array").alias("d"))
+    .select(
+        F.col("d.id").alias("document_id"),
+        F.col("ho_so_id"),
+        F.col("d.name").alias("ten_tai_lieu"),
+        F.col("d.file_url"),
+        F.col("d.Document_Typeid").cast("int").alias("loai_tai_lieu_id"),
+        F.col("event_time"),
+    )
+)
+
+cdc_docs = (
+    spark.table(f"{CATALOG}.bronze_oltp_core.document_cdc")
+    .select(
+        F.col("id").alias("document_id"),
+        F.col("Applicationid").alias("ho_so_id"),
+        F.col("name").alias("ten_tai_lieu"),
+        F.col("file_url"),
+        F.col("Document_Typeid").alias("loai_tai_lieu_id"),
+        F.col("ingested_at").alias("event_time"),
+    )
+)
+
+w_doc = Window.partitionBy("document_id").orderBy(F.col("event_time").desc())
+silver_document = (
+    xml_docs.unionByName(cdc_docs)
+    .repartition(N_PART, "ho_so_id")
+    .withColumn("rn", F.row_number().over(w_doc))
+    .filter("rn = 1")
+    .drop("rn")
+)
+
+save_silver(silver_document, "document")
+
+
+# ---------------------------------------------------------------------------
+# 6. SILVER.PAYMENT - hop nhat kenh XML (payment_array) + kenh API thanh toan
+#    GIA DINH CAN LUU Y: day la 2 KENH GHI NHAN THANH TOAN KHAC NHAU
+#    (XML export tu he thong mot cua, va API tu cong thanh toan/thue). Vi
+#    khong co khoa chung tin cay giua 2 nguon (XML co transaction_code, API
+#    co tax_code, khong giao nhau), o day tam UNION ca 2 va gan nhan nguon
+#    du lieu de doi soat. Neu ve sau xac dinh duoc day la 1 nguon trung nhau
+#    thi can bo sung logic dedup rieng - can doi chieu voi doi nghiep vu.
+# ---------------------------------------------------------------------------
+payment_item_schema = StructType([
+    StructField("id", StringType()),
+    StructField("amount", StringType()),
+    StructField("method", StringType()),
+    StructField("status", StringType()),
+    StructField("transaction_code", StringType()),
+    StructField("paid_at", StringType()),
+])
+
+xml_payments = (
+    bronze_xml
+    .withColumn(
+        "p",
+        F.from_json(
+            "data_payload",
+            StructType([StructField("payment_array", ArrayType(payment_item_schema))]),
+        ),
+    )
+    .filter(F.col("p.payment_array").isNotNull())
+    .select(F.col("id_ban_ghi").alias("ho_so_id"), F.explode("p.payment_array").alias("pm"))
+    .select(
+        F.col("pm.transaction_code").alias("ma_giao_dich"),
+        F.col("ho_so_id"),
+        F.col("pm.amount").cast("double").alias("so_tien"),
+        F.col("pm.method").alias("phuong_thuc"),
+        F.col("pm.status").alias("trang_thai_tt"),
+        F.to_timestamp("pm.paid_at").alias("thoi_gian_tt"),
+        F.lit("XML_MOT_CUA").alias("nguon_du_lieu"),
+    )
+)
+
+api_payments = (
+    bronze_api_payments
+    .select(
+        F.concat(F.lit("API_"), F.col("id_ban_ghi"), F.lit("_"), F.col("timestamp")).alias("ma_giao_dich"),
+        F.col("id_ban_ghi").alias("ho_so_id"),
+        F.col("amount").alias("so_tien"),
         F.col("method").alias("phuong_thuc"),
-        F.upper(F.col("payment_status")).alias("payment_status"),
-        F.col("tax_code").alias("ma_giao_dich"),
-        paid_at.alias("paid_at"),
-        F.coalesce(paid_at, F.col("ingested_at")).alias("event_ts"),
-        F.lit("api-payment").alias("ma_goi_tin"),
-        F.current_timestamp().alias("processed_at"),
-    ).filter(F.col("ho_so_id").isNotNull())
-
-
-def deduplicate_history(history):
-    window = Window.partitionBy("history_id").orderBy(F.col("event_ts").desc_nulls_last(), F.col("ma_goi_tin").desc())
-    return (
-        history.withColumn("_history_rank", F.row_number().over(window))
-        .filter(F.col("_history_rank") == 1)
-        .drop("_history_rank")
+        F.col("payment_status").alias("trang_thai_tt"),
+        F.to_timestamp("timestamp").alias("thoi_gian_tt"),  # STRING trong Bronze -> can to_timestamp
+        F.lit("API_THANH_TOAN").alias("nguon_du_lieu"),
     )
+)
+
+silver_payment = xml_payments.unionByName(api_payments).dropDuplicates(["ma_giao_dich"])
+save_silver(silver_payment, "payment")
 
 
-def deduplicate_payments(payments):
-    window = Window.partitionBy("payment_id").orderBy(F.col("event_ts").desc_nulls_last(), F.col("ma_goi_tin").desc())
-    return (
-        payments.withColumn("_payment_rank", F.row_number().over(window))
-        .filter(F.col("_payment_rank") == 1)
-        .drop("_payment_rank")
-    )
+# ---------------------------------------------------------------------------
+# 7. SILVER.APPLICANT - cong dan nop ho so (chi co kenh CDC)
+# ---------------------------------------------------------------------------
+applicant_events = spark.table(f"{CATALOG}.bronze_oltp_core.applicant_cdc")
+w_applicant = Window.partitionBy("id").orderBy(F.col("updated_at").desc())
+silver_applicant = (
+    applicant_events
+    .withColumn("rn", F.row_number().over(w_applicant))
+    .filter("rn = 1")
+    .drop("rn", "ingested_at")
+)
+save_silver(silver_applicant, "applicant")
 
-
-def build_current_application(events):
-    """Merge full and partial packets in their business-event order."""
-    state_window = (
-        Window.partitionBy("ho_so_id")
-        .orderBy(F.col("event_ts").asc_nulls_last(), F.col("ma_goi_tin").asc())
-        .rowsBetween(Window.unboundedPreceding, Window.currentRow)
-    )
-    latest_window = Window.partitionBy("ho_so_id").orderBy(
-        F.col("event_ts").desc_nulls_last(), F.col("ma_goi_tin").desc()
-    )
-    merged = (
-        events.withColumn("ten_ho_so", F.last("ten_ho_so", ignorenulls=True).over(state_window))
-        .withColumn("nguoi_nop_id", F.last("nguoi_nop_id", ignorenulls=True).over(state_window))
-        .withColumn("dv_cong_id", F.last("dv_cong_id", ignorenulls=True).over(state_window))
-        .withColumn("co_quan_id", F.last("co_quan_id", ignorenulls=True).over(state_window))
-        .withColumn("created_at", F.last("created_at", ignorenulls=True).over(state_window))
-        .withColumn("trang_thai_id", F.last("trang_thai_id", ignorenulls=True).over(state_window))
-        .withColumn("is_deleted", (F.col("su_kien") == F.lit("DELETE")))
-        .withColumn("_current_rank", F.row_number().over(latest_window))
-        .filter(F.col("_current_rank") == 1)
-        .drop("_current_rank", "data_payload", "file_name", "ingested_at", "su_kien", "ma_goi_tin")
-        .withColumn("processed_at", F.current_timestamp())
-    )
-    return merged
-
-
-def main() -> None:
-    spark = build_spark()
-    spark.sparkContext.setLogLevel("WARN")
-    try:
-        ensure_silver_tables(spark)
-        if not spark.catalog.tableExists(BRONZE_APPLICATION_XML):
-            raise RuntimeError(
-                f"Khong tim thay {BRONZE_APPLICATION_XML}. Hay chay job2_transactional_xml.py truoc."
-            )
-
-        xml_events = build_application_events(spark.table(BRONZE_APPLICATION_XML))
-        xml_history = build_history(xml_events)
-        xml_payments = build_payments(xml_events)
-
-        cdc_events = build_cdc_application_events(spark)
-        cdc_history = build_cdc_history(spark)
-        api_payments = build_api_payments(spark)
-
-        application_events = xml_events if cdc_events is None else xml_events.unionByName(cdc_events)
-        application_history = xml_history if cdc_history is None else deduplicate_history(xml_history.unionByName(cdc_history))
-        payments = xml_payments if api_payments is None else deduplicate_payments(xml_payments.unionByName(api_payments))
-
-        application_events = application_events.repartition("ho_so_id")
-        application_history = application_history.repartition("ho_so_id")
-        payments = payments.repartition("ho_so_id")
-        application_current = build_current_application(application_events).repartition("ho_so_id")
-
-        # Drop payload only after history/payment have parsed it.
-        overwrite_table(
-            application_events.drop("data_payload").select(
-                "ma_goi_tin", "ho_so_id", "su_kien", "event_ts", "ten_ho_so", "nguoi_nop_id",
-                "dv_cong_id", "co_quan_id", "created_at", "trang_thai_id", "file_name",
-                "ingested_at", "processed_at",
-            ),
-            SILVER_EVENTS,
-        )
-        overwrite_table(application_current, SILVER_CURRENT)
-        overwrite_table(application_history, SILVER_HISTORY)
-        overwrite_table(payments, SILVER_PAYMENT)
-    finally:
-        spark.stop()
-
-
-if __name__ == "__main__":
-    main()
+print("[+] Hoan tat Bronze -> Silver.")
+spark.stop()
