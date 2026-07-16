@@ -20,6 +20,17 @@ RUN curl -fsSL \
 # Cài đặt thêm JupyterLab và PySpark
 RUN pip install jupyterlab pyspark==3.5.1
 
+# Python 3.12 cho executor -> KHỚP driver Airflow (3.12), tránh
+# [PYTHON_VERSION_MISMATCH] khi chạy Python UDF (job2). Dùng uv (CPython
+# standalone) vì deadsnakes không dựng được trên image focal này.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN pip install --no-cache-dir uv \
+    && uv python install 3.12 \
+    && ln -sf "$(uv python find 3.12)" /usr/local/bin/python3.12 \
+    && chmod -R a+rx /opt/uv-python \
+    && python3.12 --version
+ENV PYSPARK_PYTHON=/usr/local/bin/python3.12
+
 # Khắc phục lỗi Permission Denied của JupyterLab
 RUN mkdir -p /home/spark && chown -R spark:spark /home/spark
 USER spark

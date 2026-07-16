@@ -1,0 +1,44 @@
+{
+  "realm": "lakehouse",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 900,
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "roles": {
+    "realm": [
+      { "name": "pipeline-run", "description": "Duoc phep chay pipeline qua pipeline-api" }
+    ]
+  },
+  "users": [
+    {
+      "username": "${KEYCLOAK_ROPC_USER}",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "airflow@lakehouse.local",
+      "firstName": "Airflow",
+      "lastName": "Service",
+      "credentials": [
+        { "type": "password", "value": "${KEYCLOAK_ROPC_PASSWORD}", "temporary": false }
+      ],
+      "realmRoles": ["pipeline-run"]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "${KEYCLOAK_CLIENT_ID}",
+      "name": "Airflow Pipeline Runner (ROPC)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "${KEYCLOAK_CLIENT_SECRET}",
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "defaultClientScopes": ["profile", "email", "roles"]
+    }
+  ]
+}

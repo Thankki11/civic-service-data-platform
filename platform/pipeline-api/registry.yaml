@@ -1,0 +1,90 @@
+# =====================================================================
+# Registry cua Pipeline-version API.
+# Moi pipeline co nhieu version; version tro toi 1 file .py (code_path,
+# tuong doi so voi thu muc repo mount tai /workspace) va spark_conf.
+# CustomSparkSubmitOperator goi API -> nhan code + config theo version.
+#
+# "code_path" tro thang toi job THAT cua Kien/Quan da merge trong repo,
+# nen day la registry versioned chu khong copy code.
+# =====================================================================
+
+# --- Cau hinh catalog dung chung, spark_conf cua tung pipeline ke thua & ghi de ---
+_defaults: &default_spark_conf
+  # Iceberg catalog "lakehouse" tro toi Hive Metastore + MinIO
+  spark.sql.extensions: "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+  spark.sql.catalog.lakehouse: "org.apache.iceberg.spark.SparkCatalog"
+  spark.sql.catalog.lakehouse.type: "hive"
+  spark.sql.catalog.lakehouse.uri: "thrift://hive-metastore:9083"
+  spark.sql.catalog.lakehouse.warehouse: "s3a://lakehouse/warehouse/"
+  spark.hadoop.fs.s3a.endpoint: "http://minio:9000"
+  spark.hadoop.fs.s3a.path.style.access: "true"
+  spark.hadoop.fs.s3a.impl: "org.apache.hadoop.fs.s3a.S3AFileSystem"
+  spark.hadoop.fs.s3a.connection.ssl.enabled: "false"
+  # Executor phai dung Python 3.12 khop driver Airflow (tranh PYTHON_VERSION_MISMATCH
+  # khi chay Python UDF). Image Spark da cai python3.12 qua uv.
+  spark.executorEnv.PYSPARK_PYTHON: "/usr/local/bin/python3.12"
+
+pipelines:
+  bronze_master:
+    description: "JDBC master data (source_db) -> Bronze Iceberg"
+    latest: "1.0.0"
+    versions:
+      "1.0.0":
+        code_path: "ingestion/jdbc-db/job1_master_data.py"
+        packages:
+          - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
+          - "org.apache.hadoop:hadoop-aws:3.3.4"
+          - "org.postgresql:postgresql:42.6.0"
+        spark_conf:
+          <<: *default_spark_conf
+
+  bronze_xml:
+    description: "Parse XML tu landing-zone -> Bronze (co quarantine)"
+    latest: "1.0.0"
+    versions:
+      "1.0.0":
+        code_path: "ingestion/spark-batch/job2_transactional_xml.py"
+        packages:
+          - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
+          - "org.apache.hadoop:hadoop-aws:3.3.4"
+        spark_conf:
+          <<: *default_spark_conf
+
+  bronze_api:
+    description: "Parse JSON API (NiFi -> landing) -> Bronze"
+    latest: "1.0.0"
+    versions:
+      "1.0.0":
+        code_path: "ingestion/nifi/job4_api_ingestion.py"
+        packages:
+          - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
+          - "org.apache.hadoop:hadoop-aws:3.3.4"
+        spark_conf:
+          <<: *default_spark_conf
+          spark.cores.max: "2"
+          spark.executor.cores: "1"
+          spark.executor.memory: "1g"
+
+  silver:
+    description: "Bronze -> Silver (dedup, chuan hoa)"
+    latest: "1.0.0"
+    versions:
+      "1.0.0":
+        code_path: "transform/spark-etl/bronze_to_silver.py"
+        packages:
+          - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
+          - "org.apache.hadoop:hadoop-aws:3.3.4"
+        spark_conf:
+          <<: *default_spark_conf
+
+  gold:
+    description: "Silver -> Gold (Dim/Fact, Mart)"
+    latest: "1.0.0"
+    versions:
+      "1.0.0":
+        code_path: "transform/spark-agg/silver_to_gold.py"
+        packages:
+          - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
+          - "org.apache.hadoop:hadoop-aws:3.3.4"
+        spark_conf:
+          <<: *default_spark_conf
