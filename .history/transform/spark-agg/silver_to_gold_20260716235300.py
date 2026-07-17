@@ -1,3 +1,49 @@
+# ============================================================================
+# JOB: Silver -> Gold (batch facts)
+# File : transform/spark-agg/silver_to_gold.py
+# Phu trach: Quan (DE)  |  Lich chay: dag_transform (Airflow, hang ngay ~2h sang)
+#
+# MUC DICH
+#   Tinh 2 bang FACT hang ngay theo dung DDL cua Trung
+#   (warehouse/ddl/gold_dim_fact.sql):
+#     - gold.fact_ton_dong_ho_so   : Periodic Snapshot Fact, grain = 1 ngay/1 ho so
+#                                     dang mo (chua COMPLETED/REJECTED)
+#     - gold.fact_van_hanh_co_quan : Aggregated Fact, grain = 1 ngay/1 co quan
+#
+#   fact_xu_ly_ho_so (transactional, grain = 1 hanh dong xu ly) KHONG duoc
+#   tinh o day - theo dung thiet ke da thong nhat, bang nay duoc phuc vu
+#   REAL-TIME truc tiep tu StarRocks (xem transform/starrocks/ddl_realtime.sql).
+#
+#   5 bang DIM (it thay doi) KHONG duoc build o day - nhom load thu cong
+#   qua transform/spark-agg/build_dim_tables.py khi danh muc thay doi.
+#
+# LUU Y VE 1 CHO LECH KIEU DU LIEU DA PHAT HIEN TRONG DDL GOC
+#   warehouse/ddl/gold_dim_fact.sql khai bao "ho_so_id BIGINT" o ca 3 fact,
+#   nhung ma ho so thuc te trong he thong nguon la CHUOI dang "HS_00001"
+#   (xem Application.id, id_ban_ghi trong XML...). Neu giu BIGINT se buoc
+#   phai quy uoc "bo tien to HS_ + cast so" moi noi join - de gay loi khi
+#   dinh dang ID thay doi ve sau. Job nay tao ho_so_id la STRING (dung voi
+#   du lieu thuc), va de nghi sua lai 2 dong DDL tuong ung (da sua kem trong
+#   ban giao, xem phan mo ta). Cot surrogate key "id" van la BIGINT nhu DDL
+#   goc, dung ham bam xxhash64(thoi_gian_id, khoa nghiep vu) de tao ra.
+#
+# NGAY CHOT SO DEMO
+#   Job batch cua demo luon chot so cho HOM QUA, phu hop DAG chay luc 2h sang.
+#   Khong ho tro backfill lich su trong pham vi demo nay.
+#
+# GHI DE THEO PARTITION (khong lam mat lich su cac ngay khac)
+#   2 bang fact deu PARTITIONED BY (thoi_gian_id) - moi ngay 1 partition.
+#   Bat spark.sql.sources.partitionOverwriteMode=dynamic de .mode("overwrite")
+#   CHI thay the dung partition co trong DataFrame dang ghi (1 ngay
+#   snapshot_date), khong dung tay vao du lieu cac ngay khac da co san.
+#
+# THIET KE TRANH OOM
+#   - Cac phep tinh cap "co quan" join tren tap Agency/Service RAT NHO ->
+#     dung broadcast() de tranh shuffle khong can thiet
+#   - Khong dung .collect()/.toPandas()
+#   - AQE bat san (giong bronze_to_silver.py)
+# ============================================================================
+
 from datetime import datetime, timedelta
 
 from pyspark.sql import SparkSession, Window
@@ -97,9 +143,17 @@ calendar_cutoff = F.broadcast(
 
 # ===========================================================================
 # 2. FACT_TON_DONG_HO_SO  (Periodic Snapshot Fact - 1 dong/1 ngay/1 ho so mo)
+#    Mapping logic theo dung bao cao thuc tap (muc "Mapping Logic - Fact
+#    Xu Ly & Fact Ton Dong"):
+#      so_ngay_ton_dong_hien_tai = Moc chot (23:59:59) - action_time cua
+#                                  buoc trang thai hien tai (lan cap nhat
+#                                  gan nhat tinh den cutoff)
+#      tong_thoi_gian_da_xu_ly   = Moc chot (23:59:59) - Application.created_at
 # ===========================================================================
+# Trang thai/can bo "as-of" phai lay tu history truoc moc chot. Khong duoc
+# dung trang_thai hien tai cua silver.application: job Gold chay luc 02:00
+# co the da nhin thay thay doi cua ngay moi va lam sai snapshot hom qua.
 w_latest_before_cutoff = Window.partitionBy("ho_so_id").orderBy(F.col("action_time").desc())
-
 latest_state_as_of_cutoff = (
     silver_history
     .filter(F.col("action_time") <= F.lit(cutoff_ts))
@@ -113,8 +167,10 @@ latest_state_as_of_cutoff = (
     )
 )
 
-# Application giu cac thuoc tinh on dinh (co quan, dich vu, ngay nop). Trang thai de quyet dinh ton dong phai la trang thai cua history tai cutoff.
-# Neu event DELETE xay ra SAU cutoff, ho so van phai xuat hien trong snapshot cua ngay truoc; neu DELETE xay ra truoc cutoff thi loai ra.
+# Application giu cac thuoc tinh on dinh (co quan, dich vu, ngay nop). Trang
+# thai de quyet dinh ton dong phai la trang thai cua history tai cutoff.
+# Neu event DELETE xay ra SAU cutoff, ho so van phai xuat hien trong snapshot
+# cua ngay truoc; neu DELETE xay ra truoc cutoff thi loai ra.
 open_apps = (
     silver_application
     .filter(
@@ -151,7 +207,7 @@ fact_ton_dong_raw = (
 
 fact_ton_dong_ho_so = fact_ton_dong_raw.select(
     F.xxhash64(F.lit(thoi_gian_id), F.col("ho_so_id")).alias("id"),   # surrogate key BIGINT
-    F.col("ho_so_id"), 
+    F.col("ho_so_id"),                                                 # STRING - xem ghi chu dau file
     F.col("trang_thai_id"),
     F.col("co_quan_id"),
     F.col("can_bo_id"),
@@ -164,7 +220,10 @@ fact_ton_dong_ho_so = fact_ton_dong_raw.select(
 
 save_gold_partitioned(fact_ton_dong_ho_so, "fact_ton_dong_ho_so")
 
-# cache() vi bang nay nho (so ho so dang mo), duoc TAI SU DUNG ngay ben duoi cho fact_van_hanh_co_quan.so_luong_ton_dong -> DAM BAO 2 fact luon khop so
+# cache() vi bang nay nho (so ho so dang mo), duoc TAI SU DUNG ngay ben duoi
+# cho fact_van_hanh_co_quan.so_luong_ton_dong -> DAM BAO 2 fact luon khop so
+# (khong tinh backlog 2 lan bang 2 cach khac nhau -> tranh lech du lieu khi
+# len dashboard)
 fact_ton_dong_ho_so.cache()
 
 # ===========================================================================
@@ -188,7 +247,10 @@ backlog_today = (
 
 # 3.3 Ho so COMPLETED trong ngay -> tach dung han / tre han
 #     (Tong thoi gian xu ly thuc te = COMPLETED.action_time - Application.
-#     created_at, so sanh voi Service.processing_time.
+#     created_at, so sanh voi Service.processing_time. Luong hien tai
+#     REJECTED la trang thai KET THUC - khong quay lai xu ly tiep - nen
+#     khong co buoc tru thoi gian REJECTED nhu mo ta cho truong hop tong
+#     quat hon trong bao cao.)
 completed_today = (
     silver_history
     .filter((F.col("trang_thai_id") == STATUS_COMPLETED) & (F.to_date("action_time") == F.lit(str(snapshot_date))))
@@ -254,8 +316,9 @@ fee_today = (
     .agg(F.sum("so_tien").alias("tong_chi_phi"))
 )
 
-# 3.6 Hop nhat: xuat phat tu TOAN BO danh sach co quan (silver.agency) de moi co quan deu co 1 dong/ngay du hom do khong phat sinh gi (tranh dashboard "thieu cot" gay hieu nham la khong co du lieu)
-
+# 3.6 Hop nhat: xuat phat tu TOAN BO danh sach co quan (silver.agency) de moi
+#     co quan deu co 1 dong/ngay du hom do khong phat sinh gi (tranh dashboard
+#     "thieu cot" gay hieu nham la khong co du lieu)
 fact_van_hanh_co_quan = (
     silver_agency
     .join(received_today, "co_quan_id", "left")

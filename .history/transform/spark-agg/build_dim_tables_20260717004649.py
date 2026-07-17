@@ -1,3 +1,16 @@
+# ============================================================================
+# JOB: Build 5 bang DIM (dim_thoi_gian, dim_co_quan, dim_trang_thai,
+#      dim_can_bo, dim_dich_vu_cong)
+# File : transform/spark-agg/build_dim_tables.py
+# Phu trach: Quan (DE)
+#
+# KHI NAO CHAY JOB NAY
+#   KHONG nam trong lich Airflow hang ngay. Day la du lieu danh muc RAT IT
+#   thay doi (danh sach co quan, trang thai, dich vu cong, can bo...), nen
+#   nhom chu dong chay THU CONG job nay 1 lan luc khoi tao he thong, va chay
+#   lai (idempotent - chay bao nhieu lan cung ra ket qua dung) MOI KHI danh
+#   muc co thay doi (them co quan moi, doi SLA dich vu...).
+#
 # GHI RA 2 NOI trong CUNG 1 lan chay
 #   (1) lakehouse.gold.dim_* (Iceberg, qua Hive Metastore) - de Trino truy van.
 #   (2) StarRocks gold_realtime.dim_* (qua JDBC/MySQL protocol) - de bang
@@ -8,7 +21,9 @@
 #       lai job nhieu lan.
 #
 # YEU CAU TRUOC KHI CHAY LAN DAU
-#   Da chay transform/starrocks/ddl_realtime.sql (tao database gold_realtime va cac bang dim/ods/MV ben StarRocks) va da co bang lakehouse.gold.dim_*
+#   Da chay transform/starrocks/ddl_realtime.sql (tao database gold_realtime
+#   va cac bang dim/ods/MV ben StarRocks) va da co bang lakehouse.gold.dim_*
+#   (transform/warehouse/ddl/gold_dim_fact.sql, da co san boi Trung).
 # ============================================================================
 
 from pyspark.sql import SparkSession, Window
@@ -94,8 +109,12 @@ def save_dim(df, table_name):
 # ---------------------------------------------------------------------------
 # 1. DIM_THOI_GIAN - date spine sinh bang Spark (khong can bang nguon)
 #    co_phai_la_ngay_nghi = Thu 7/CN HOAC nam trong danh sach ngay le co dinh
+#    (GIA DINH DON GIAN HOA: chi liet ke cac ngay le duong lich co dinh; CHUA
+#    tinh ngay le AM LICH (Tet Nguyen Dan...) vi ngay am lich doi moi nam,
+#    can bang tra cuu rieng - de nghi bo sung sau boi nguoi phu trach nghiep
+#    vu neu can chinh xac tuyet doi cho KPI "thoi_gian_xu_ly" loai tru ngay nghi.
 # ---------------------------------------------------------------------------
-FIXED_HOLIDAYS_MMDD = {"01-01", "04-30", "05-01", "09-02"}  
+FIXED_HOLIDAYS_MMDD = {"01-01", "04-30", "05-01", "09-02"}  # Tet Duong, 30/4, 1/5, Quoc Khanh
 
 date_spine = (
     # Pham vi demo: du de bao phu du lieu mau va dashboard gan hien tai,
@@ -112,6 +131,8 @@ date_spine = (
         "co_phai_la_ngay_nghi",
         (F.col("thu_trong_tuan").isin(1, 7)) | (F.col("mmdd").isin(*FIXED_HOLIDAYS_MMDD)),
     )
+    # Cumulative workday sequence lets Gold calculate elapsed business days
+    # with two small dimension joins instead of an expensive date-range join.
     .withColumn(
         "stt_ngay_lam_viec",
         F.sum(F.when(~F.col("co_phai_la_ngay_nghi"), F.lit(1)).otherwise(F.lit(0))).over(
@@ -180,7 +201,8 @@ silver_officer = spark.table(f"{CATALOG}.silver.officer")
 silver_officer_role = spark.table(f"{CATALOG}.silver.officer_role")
 silver_role = spark.table(f"{CATALOG}.silver.role").select(F.col("id").alias("Roleid"), F.col("name").alias("vi_tri"))
 
-# 1 can bo co the co nhieu vai tro trong Officer_Role (n-n) -> lay 1 vai tro dai dien (vai tro dau tien theo Roleid) de dim_can_bo giu dung grain
+# 1 can bo co the co nhieu vai tro trong Officer_Role (n-n) -> lay 1 vai tro
+# dai dien (vai tro dau tien theo Roleid) de dim_can_bo giu dung grain
 # "1 dong/1 can bo" nhu DDL da dinh nghia.
 from pyspark.sql import Window  # noqa: E402 - import cuc bo cho ro muc dich dung
 
