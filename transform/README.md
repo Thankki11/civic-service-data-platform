@@ -27,8 +27,8 @@ Hai đường cùng dùng các khóa nghiệp vụ `ho_so_id`, `co_quan_id`, `dv
 
 | Đối tượng | Grain | Nguồn chính | Ý nghĩa |
 |---|---:|---|---|
-| `silver.application` | 1 dòng / hồ sơ | XML + CDC | Bản trạng thái hiện tại, đã forward-fill dữ liệu XML partial. |
-| `silver.application_history` | 1 dòng / hành động | XML + CDC | Nhật ký chuyển trạng thái bất biến. |
+| `silver.application` | 1 dòng / hồ sơ | XML + CDC | Hợp nhất hai tập hồ sơ bổ sung trong data mẫu; chọn version mới nhất theo `event_time`. |
+| `silver.application_history` | 1 dòng / hành động | XML + CDC | Nhật ký bất biến, union hai input rồi append chống trùng theo `history_id`. |
 | `gold.fact_ton_dong_ho_so` | 1 dòng / hồ sơ mở / ngày | Silver application + history | Snapshot backlog ở 23:59:59. |
 | `gold.fact_van_hanh_co_quan` | 1 dòng / cơ quan / ngày | Các fact/nguồn Silver | KPI lãnh đạo. |
 | `gold_realtime.fact_xu_ly_ho_so` | 1 dòng / hành động | StarRocks ODS history + application | Duration từng bước xử lý realtime. |
@@ -40,7 +40,7 @@ Trạng thái: `RECEIVED(1) -> ASSIGNED(2) -> PROCESSING(3) -> PENDING_APPROVAL(
 ## 3. Điều kiện trước khi chạy transform
 
 1. Docker Desktop/Engine đang chạy.
-2. Bronze master data, CDC tables đã tồn tại. XML và API là nguồn optional: Silver vẫn chạy khi hai table Bronze này chưa tồn tại, nhưng không có payment/XML contribution trong lần chạy đó.
+2. Bronze master data cần sẵn sàng. XML, CDC và API được đọc độc lập và union khi cùng tạo một thực thể Silver; bảng input chưa được ingest chỉ bị bỏ qua riêng input đó.
 3. Lần đầu chạy StarRocks cần tạo schema trước khi `build_dim_tables.py` ghi JDBC.
 4. `data-master-gen` cần chạy ít nhất một lần để tạo master data và schema OLTP mà simulator CDC dùng.
 
@@ -116,7 +116,7 @@ docker exec spark-master /opt/spark/bin/spark-submit `
   /opt/spark-data/transform/spark-agg/silver_to_gold.py
 ```
 
-Job chốt số cho **hôm qua**. Nó ghi đè động đúng partition `thoi_gian_id` của ngày đó, không làm mất các ngày Gold trước.
+Job chốt số cho **hôm qua**. Hai Gold fact là periodic snapshot: job thay thế nguyên partition `thoi_gian_id` của ngày đang chốt bằng atomic Iceberg overwrite. Cách này idempotent khi chạy lại và cũng xóa dòng backlog cũ nếu hồ sơ đã đóng sau khi tính lại; các partition ngày khác không bị ảnh hưởng.
 
 ### 5.6 Tạo Routine Load realtime
 
@@ -134,12 +134,12 @@ docker exec -it starrocks mysql -h 127.0.0.1 -P 9030 -uroot `
 
 ### `spark-etl/bronze_to_silver.py`
 
-**Spark session và `save_silver()`**
+**Spark session và các hàm ghi Silver**
 
 - Kết nối Hive Metastore/Iceberg qua MinIO.
 - Bật AQE và skew join để hạn chế OOM.
-- `save_silver()` tạo Iceberg table nếu chưa có và overwrite toàn bộ Silver. Đây là lựa chọn idempotent cho demo; Bronze vẫn là lịch sử gốc.
-- `read_optional_bronze()` trả DataFrame rỗng đúng schema nếu XML/API chưa được ingest. Nhờ đó demo CDC-only không fail toàn bộ job.
+- Chiến lược ghi Silver theo nghĩa nghiệp vụ: master data là full snapshot nên replace cả bảng; `application`, `document`, `applicant` là current-state nên `MERGE`; `application_history` và `payment` là event/giao dịch bất biến nên `APPEND` chống trùng theo business key.
+- Theo generator mẫu, XML (`HS_00001...`) và CDC (`HS_100000...`) là hai tập hồ sơ bổ sung. Job union các input này; `tableExists` chỉ dùng để không đọc một input chưa ingest, không còn là quy tắc chọn nguồn.
 
 **Master data**
 
@@ -149,21 +149,18 @@ docker exec -it starrocks mysql -h 127.0.0.1 -P 9030 -uroot `
 
 **Application: điểm quan trọng nhất của Silver**
 
-- XML có thể là `PARTIAL_STATUS`, chỉ có `Statusid`; CDC thường có full row.
-- Hai nguồn được union và sắp theo `event_time`, thêm `source_priority` để CDC thắng khi đồng thời điểm.
-- `last(..., ignorenulls=True)` trên từng cột thực hiện forward-fill: status packet partial không làm mất tên hồ sơ, dịch vụ, cơ quan, người nộp hoặc ngày tạo.
-- Sau forward-fill, `row_number` chọn event mới nhất cho mỗi `ho_so_id`.
-- `da_bi_xoa` là dấu xóa từ XML, còn `event_time` giữ lại để Gold biết delete xảy ra trước hay sau cutoff.
+- XML `PARTIAL_STATUS` được forward-fill bằng `last(..., ignorenulls=True)` sau khi union với CDC, rồi chọn event mới nhất cho mỗi `ho_so_id`.
+- `da_bi_xoa` được lấy từ event DELETE của XML; `event_time` được giữ để Gold xét cutoff.
 
 **Application history và document**
 
 - ID là business key dạng chuỗi (`H_xxx`, `DOC_xxx`), tuyệt đối không cast sang số.
-- Union XML/CDC và dedup theo `history_id` hoặc `document_id` bằng event mới nhất.
+- Union XML và CDC; trong tập hợp chung dedup theo `history_id` hoặc `document_id` bằng event mới nhất.
 - `can_bo_id = -1` là Unknown member, giúp fact join được dim ngay cả khi hồ sơ mới nhận chưa phân công.
 
 **Payment và applicant**
 
-- Payment XML/API được union; hiện không có khóa đối soát tin cậy xuyên nguồn nên giữ `nguon_du_lieu` để tránh dedup sai.
+- Payment union XML và API. XML dùng `transaction_code`; mock API không có transaction id nên dùng `tax_code` làm payment reference, tránh gộp hai giao dịch cùng hồ sơ/cùng giây.
 - Applicant là SCD current-state đơn giản: giữ version có `updated_at` mới nhất.
 
 ### `spark-agg/build_dim_tables.py`
@@ -184,7 +181,7 @@ File này xây cả Iceberg Gold và StarRocks dimensions trong cùng một lầ
 
 - `snapshot_date = hôm qua`; `cutoff_ts = 23:59:59` của ngày đó.
 - Fact Gold partition theo `thoi_gian_id = yyyymmdd`.
-- `partitionOverwriteMode=dynamic` chỉ thay đúng partition đang xử lý.
+- Hai fact Gold là periodic snapshot, do đó replace duy nhất partition `thoi_gian_id` của ngày chốt thay vì `APPEND` hoặc `MERGE` theo dòng.
 
 **`fact_ton_dong_ho_so`**
 

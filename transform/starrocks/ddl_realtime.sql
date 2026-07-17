@@ -7,7 +7,6 @@
 -- la BIGINT, key bat dau bang id), hay reset RIENG database gold_realtime va
 -- tao lai 2 Routine Load trong moi truong demo truoc khi chay file nay.
 --
-============================================================================
 
 CREATE DATABASE IF NOT EXISTS gold_realtime;
 USE gold_realtime;

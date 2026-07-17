@@ -41,15 +41,19 @@ spark = (
     .config("spark.sql.adaptive.enabled", "true")
     .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
     .config("spark.sql.adaptive.skewJoin.enabled", "true")
-    # Quan trong: chi ghi de dung partition (ngay) dang xu ly, giu nguyen lich su
-    .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
     .getOrCreate()
 )
 spark.sparkContext.setLogLevel("WARN")
 spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.gold")
 
 
-def save_gold_partitioned(df, table_name):
+def replace_gold_snapshot_partition(df, table_name):
+    """Thay dung partition ngay chot so cua periodic snapshot fact.
+
+    Khong APPEND (rerun se trung grain) va khong MERGE theo dong (co the con
+    sot mot ho so da dong sau khi tinh lai). overwrite theo filter la mot
+    Iceberg atomic commit, chi dong vao partition thoi_gian_id dang chay.
+    """
     full_name = f"{CATALOG}.gold.{table_name}"
     schema_sql = ", ".join(f"`{f.name}` {f.dataType.simpleString()}" for f in df.schema.fields)
     spark.sql(f"""
@@ -58,8 +62,8 @@ def save_gold_partitioned(df, table_name):
         PARTITIONED BY (thoi_gian_id)
         LOCATION 's3a://lakehouse/warehouse/gold/{table_name}'
     """)
-    df.write.format("iceberg").mode("overwrite").save(full_name)
-    print(f"[+] gold.{table_name} <- da ghi partition thoi_gian_id={thoi_gian_id}")
+    df.writeTo(full_name).overwrite(F.col("thoi_gian_id") == F.lit(thoi_gian_id))
+    print(f"[+] gold.{table_name} <- REPLACE partition thoi_gian_id={thoi_gian_id}")
 
 
 silver_application = spark.table(f"{CATALOG}.silver.application")
@@ -162,7 +166,7 @@ fact_ton_dong_ho_so = fact_ton_dong_raw.select(
     F.lit(thoi_gian_id).alias("thoi_gian_id"),
 )
 
-save_gold_partitioned(fact_ton_dong_ho_so, "fact_ton_dong_ho_so")
+replace_gold_snapshot_partition(fact_ton_dong_ho_so, "fact_ton_dong_ho_so")
 
 # cache() vi bang nay nho (so ho so dang mo), duoc TAI SU DUNG ngay ben duoi cho fact_van_hanh_co_quan.so_luong_ton_dong -> DAM BAO 2 fact luon khop so
 fact_ton_dong_ho_so.cache()
@@ -281,7 +285,7 @@ fact_van_hanh_co_quan = (
     )
 )
 
-save_gold_partitioned(fact_van_hanh_co_quan, "fact_van_hanh_co_quan")
+replace_gold_snapshot_partition(fact_van_hanh_co_quan, "fact_van_hanh_co_quan")
 
 fact_ton_dong_ho_so.unpersist()
 print("[+] Hoan tat Silver -> Gold.")

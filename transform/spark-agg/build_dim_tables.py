@@ -53,7 +53,7 @@ spark.sparkContext.setLogLevel("WARN")
 spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.gold")
 
 
-def save_dim(df, table_name):
+def save_dim(df, table_name, key_cols):
     """Ghi 1 dim vao ca Iceberg gold (Trino) va StarRocks gold_realtime (MV realtime)."""
     full_name = f"{CATALOG}.gold.{table_name}"
     schema_sql = ", ".join(f"`{f.name}` {f.dataType.simpleString()}" for f in df.schema.fields)
@@ -63,7 +63,7 @@ def save_dim(df, table_name):
         LOCATION 's3a://lakehouse/warehouse/gold/{table_name}'
     """)
     # Iceberg does not infer newly added dimension fields from CREATE TABLE IF
-    # NOT EXISTS. Evolve the existing local schema before the overwrite so an
+    # NOT EXISTS. Evolve the existing local schema before the upsert so an
     # environment created with the old calendar DDL can receive ngay_date and
     # stt_ngay_lam_viec without dropping its table.
     existing_columns = {field.name.lower() for field in spark.table(full_name).schema.fields}
@@ -72,7 +72,20 @@ def save_dim(df, table_name):
             spark.sql(
                 f"ALTER TABLE {full_name} ADD COLUMN `{field.name}` {field.dataType.simpleString()}"
             )
-    df.write.format("iceberg").mode("overwrite").save(full_name)
+    source_view = f"_gold_{table_name}_source"
+    df.createOrReplaceTempView(source_view)
+    match = " AND ".join(f"t.`{key}` <=> s.`{key}`" for key in key_cols)
+    assignments = ", ".join(f"t.`{field.name}` = s.`{field.name}`" for field in df.schema.fields)
+    columns = ", ".join(f"`{field.name}`" for field in df.schema.fields)
+    values = ", ".join(f"s.`{field.name}`" for field in df.schema.fields)
+    spark.sql(f"""
+        MERGE INTO {full_name} t
+        USING {source_view} s
+        ON {match}
+        WHEN MATCHED THEN UPDATE SET {assignments}
+        WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ({values})
+    """)
+    spark.catalog.dropTempView(source_view)
 
     # Dimension chi co it dong. Gom mot partition va ghi theo batch de tranh
     # hang tram JDBC connection/commit nho vao StarRocks (dac biet dim_time).
@@ -129,7 +142,7 @@ date_spine = (
         "stt_ngay_lam_viec",
     )
 )
-save_dim(date_spine, "dim_thoi_gian")
+save_dim(date_spine, "dim_thoi_gian", ["thoi_gian_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +167,7 @@ dim_co_quan = (
         F.col("phuong"),
     )
 )
-save_dim(dim_co_quan, "dim_co_quan")
+save_dim(dim_co_quan, "dim_co_quan", ["co_quan_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +181,7 @@ dim_trang_thai = (
         F.col("name").alias("ten_trang_thai"),
     )
 )
-save_dim(dim_trang_thai, "dim_trang_thai")
+save_dim(dim_trang_thai, "dim_trang_thai", ["trang_thai_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +219,7 @@ dim_can_bo_unknown = spark.createDataFrame(
     [(-1, "Khong xac dinh", "N/A")], schema="can_bo_id int, ten string, vi_tri string"
 )
 dim_can_bo = dim_can_bo_real.unionByName(dim_can_bo_unknown)
-save_dim(dim_can_bo, "dim_can_bo")
+save_dim(dim_can_bo, "dim_can_bo", ["can_bo_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +233,7 @@ dim_dich_vu_cong = (
         F.col("processing_time").alias("thoi_han_tra_kq"),
     )
 )
-save_dim(dim_dich_vu_cong, "dim_dich_vu_cong")
+save_dim(dim_dich_vu_cong, "dim_dich_vu_cong", ["dv_cong_id"])
 
 print("[+] Hoan tat build 5 bang dim (Iceberg + StarRocks).")
 spark.stop()

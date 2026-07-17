@@ -28,6 +28,7 @@ data/
 *.parquet
 *.csv
 !warehouse/validation/*.csv
+.history
 
 # IDE / OS
 .idea/
