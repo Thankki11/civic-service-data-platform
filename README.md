@@ -54,6 +54,19 @@ cp .env.example .env        # sửa credential nếu cần
 docker compose up -d
 ```
 
+## Query Gold bằng Trino
+
+Trino được khai báo sẵn trong Compose và dùng catalog `iceberg` để đọc metadata
+từ Hive Metastore, file Iceberg từ MinIO. Có thể khởi động riêng và kiểm tra:
+
+```bash
+docker compose up -d trino
+docker compose exec trino trino --execute "SHOW TABLES FROM iceberg.gold"
+```
+
+Superset (khi được dựng) chỉ cần kết nối đến `trino:8080`; nó không kết nối
+trực tiếp đến MinIO.
+
 Các UI sau khi chạy:
 
 | Service        | URL                    | Ghi chú                    |
@@ -63,7 +76,7 @@ Các UI sau khi chạy:
 | Airflow        | http://localhost:8080  | DAG điều phối              |
 | Spark Master   | http://localhost:8081  | Theo dõi job Spark         |
 | StarRocks FE   | http://localhost:8030  | Real-time OLAP             |
-| Trino          | http://localhost:8082  | Query engine cho Gold      |
+| Trino          | http://localhost:8085  | Query engine cho Gold      |
 | Superset       | http://localhost:8088  | Dashboard                  |
 
 ## Quy ước Git

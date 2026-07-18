@@ -216,6 +216,22 @@ services:
     networks:
       - spark-network
 
+  # Trino chi la query engine: doc Iceberg metadata tu Hive Metastore va data
+  # Gold tu MinIO. Superset se ket noi den service nay, khong ket noi MinIO.
+  trino:
+    image: trinodb/trino:477
+    container_name: trino
+    hostname: trino
+    ports:
+      - "8085:8080"
+    volumes:
+      - ./transform/metastore/trino-catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+    depends_on:
+      - hive-metastore
+      - minio
+    networks:
+      - spark-network
+
   # StarRocks (FE+BE trong 1 container - phu hop moi truong dev/demo).
   # Hostname "starrocks" phai khop voi warehouse/superset/CONNECTIONS.md
   # (starrocks://root:@starrocks:9030/) va voi transform/starrocks/*.sql

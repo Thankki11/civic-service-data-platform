@@ -51,13 +51,23 @@ def bronze_exists(table_name):
     return spark.catalog.tableExists(table_name)
 
 
-def create_silver_table(df, table_name):
-    """Tao Iceberg table neu chua ton tai va tra ve ten day du."""
+def create_silver_table(df, table_name, partition_transform=None):
+    """Tao Iceberg table neu chua ton tai va tra ve ten day du.
+
+    `partition_transform` chi dung cho event table co business timestamp,
+    vi du `days(action_time)`. Bang current-state va dimension nho khong nen
+    bi partition theo ngay ingest.
+    """
     full_name = f"{CATALOG}.silver.{table_name}"
     schema_sql = ", ".join(f"`{field.name}` {field.dataType.simpleString()}" for field in df.schema.fields)
+    partition_clause = (
+        f"\n        PARTITIONED BY ({partition_transform})"
+        if partition_transform else ""
+    )
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {full_name} ({schema_sql})
         USING iceberg
+        {partition_clause}
         LOCATION 's3a://lakehouse/warehouse/silver/{table_name}'
     """)
     existing_columns = {field.name.lower() for field in spark.table(full_name).schema.fields}
@@ -90,9 +100,9 @@ def merge_current_state(df, table_name, key_cols):
     print(f"[+] silver.{table_name} <- MERGE current-state theo {', '.join(key_cols)}")
 
 
-def append_new_events(df, table_name, key_cols):
+def append_new_events(df, table_name, key_cols, partition_transform=None):
     """APPEND event bat bien, chi chen key chua co de job chay lai khong trung."""
-    full_name = create_silver_table(df, table_name)
+    full_name = create_silver_table(df, table_name, partition_transform)
     source_view = f"_silver_{table_name}_source"
     df.createOrReplaceTempView(source_view)
     match = " AND ".join(f"t.`{key}` <=> s.`{key}`" for key in key_cols)
@@ -241,19 +251,17 @@ if bronze_xml is not None:
 cdc_application = None
 if bronze_cdc_application is not None:
     cdc_application = bronze_cdc_application.select(
-        F.concat(
-            F.lit("CDC_"),
-            F.sha2(
-                F.concat_ws(
-                    "\u001f",
-                    F.col("id"),
-                    F.col("updated_at").cast("string"),
-                    F.col("Statusid").cast("string"),
-                    F.col("Serviceid").cast("string"),
-                    F.col("Agencyid").cast("string"),
-                ),
-                256,
-            ),
+        # Event ID de dedup, khong phai change hash SCD2. Cac thanh phan nay
+        # la ID/timestamp/so nen co the noi truc tiep, de logic khong phu
+        # thuoc vao SHA va khong co rui ro hash collision.
+        F.concat_ws(
+            "\u001f",
+            F.lit("CDC"),
+            F.coalesce(F.col("id"), F.lit("<NULL>")),
+            F.coalesce(F.col("updated_at").cast("string"), F.lit("<NULL>")),
+            F.coalesce(F.col("Statusid").cast("string"), F.lit("<NULL>")),
+            F.coalesce(F.col("Serviceid").cast("string"), F.lit("<NULL>")),
+            F.coalesce(F.col("Agencyid").cast("string"), F.lit("<NULL>")),
         ).alias("event_id"),
         F.col("id").alias("ho_so_id"), F.col("name").alias("ten_ho_so"),
         F.col("Applicantid").alias("applicant_id"), F.col("Serviceid").alias("dv_cong_id"),
@@ -289,12 +297,17 @@ xml_history = None
 if bronze_xml is not None:
     xml_history = parse_xml_collection(
         bronze_xml, "$.application_history_array.application_history", history_item_schema
-    ).select(F.col("id_ban_ghi").alias("ho_so_id"), F.explode("_items").alias("item")).select(
+    ).select(
+        F.col("id_ban_ghi").alias("ho_so_id"),
+        F.col("ingested_at").alias("source_ingested_at"),
+        F.explode("_items").alias("item"),
+    ).select(
         F.col("item.id").alias("history_id"), "ho_so_id",
         F.col("item.Statusid").cast("int").alias("trang_thai_truoc_id"),
         F.col("item.Statusid2").cast("int").alias("trang_thai_id"),
         F.coalesce(F.col("item.Officerid").cast("int"), F.lit(-1)).alias("can_bo_id"),
         F.to_timestamp("item.action_time").alias("action_time"), F.col("item.note").alias("note"),
+        "source_ingested_at",
         F.lit(1).alias("source_priority"),
     )
 
@@ -304,13 +317,19 @@ if bronze_cdc_history is not None:
         F.col("id").alias("history_id"), F.col("Applicationid").alias("ho_so_id"),
         F.col("Statusid").alias("trang_thai_truoc_id"), F.col("Statusid2").alias("trang_thai_id"),
         F.coalesce(F.col("Officerid"), F.lit(-1)).alias("can_bo_id"), F.col("action_time"), F.col("note"),
+        F.col("ingested_at").alias("source_ingested_at"),
         F.lit(2).alias("source_priority"),
     )
 
 history = union_available(xml_history, cdc_history)
 if history is not None:
     history = latest(history, "history_id", "action_time", "source_priority").drop("source_priority")
-    append_new_events(history, "application_history", ["history_id"])
+    append_new_events(
+        history,
+        "application_history",
+        ["history_id"],
+        partition_transform="days(action_time)",
+    )
 
 
 document_item_schema = StructType([
