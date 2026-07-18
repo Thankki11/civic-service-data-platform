@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import current_timestamp, input_file_name, lit
 
@@ -5,6 +7,7 @@ MINIO_ENDPOINT = "http://minio:9000"
 MINIO_ACCESS_KEY = "minio_access_key" 
 MINIO_SECRET_KEY = "minio_secret_key" 
 ICEBERG_WAREHOUSE = "s3a://lakehouse/warehouse/"   
+MASTER_SNAPSHOT_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 spark = SparkSession.builder \
@@ -47,11 +50,18 @@ def process_master_data():
                 .option("password", "source_db") \
                 .option("driver", "org.postgresql.Driver") \
                 .load()
+
+            # Bronze master luu append theo snapshot de batch SCD2 co the so
+            # sanh cac lan chup. Loai ban ghi trung HOAN TOAN truoc khi them
+            # audit/snapshot_id; neu khong, mot snapshot co the tu tao nhieu
+            # version cho cung business key o downstream.
+            df = df.dropDuplicates()
             
             # 2. Thêm cột Audit
             df_enriched = df \
                 .withColumn("ingested_at", current_timestamp()) \
-                .withColumn("file_name", lit(f"jdbc:postgresql://source_db/{table_name}"))
+                .withColumn("file_name", lit(f"jdbc:postgresql://source_db/{table_name}")) \
+                .withColumn("snapshot_id", lit(MASTER_SNAPSHOT_ID))
             
             # Tên bảng đích trên Iceberg
             iceberg_table_name = f"lakehouse.bronze_master_data.{table_name.lower()}"
@@ -61,8 +71,8 @@ def process_master_data():
             # Tạo schema string
             schema_sql = ", ".join([f"{f.name} {f.dataType.simpleString()}" for f in df_enriched.schema.fields])
             
-            # 3. Ghi đè (Overwrite) toàn bộ dữ liệu vào bảng Iceberg trên MinIO
-            print(f"[*] Đang ghi đè (Overwrite) vào Iceberg: {iceberg_table_name}...")
+            # 3. Tạo bảng Iceberg nếu cần; dữ liệu bên dưới được append theo snapshot.
+            print(f"[*] Đang ghi append snapshot vào Iceberg: {iceberg_table_name}...")
             
             # Tạo bảng nếu chưa có với Partitioning và Location tĩnh
             spark.sql(f"""
@@ -71,11 +81,15 @@ def process_master_data():
                 PARTITIONED BY (days(ingested_at))
                 LOCATION 's3a://lakehouse/warehouse/bronze/master_data/{table_name.lower()}'
             """)
+
+            existing_columns = {
+                field.name.lower() for field in spark.table(iceberg_table_name).schema.fields
+            }
+            if "snapshot_id" not in existing_columns:
+                spark.sql(f"ALTER TABLE {iceberg_table_name} ADD COLUMN snapshot_id STRING")
             
-            df_enriched.write \
-                .format("iceberg") \
-                .mode("overwrite") \
-                .save(iceberg_table_name)
+            # Bronze master la lich su snapshot cho SCD2, khong overwrite.
+            df_enriched.writeTo(iceberg_table_name).append()
                 
             print(f"[+] Đã ghi thành công bảng: {iceberg_table_name}")
             

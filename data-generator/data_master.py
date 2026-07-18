@@ -65,6 +65,48 @@ def save_to_db(table_name, data):
 # ==========================================
 # 1. CÁC BẢNG DANH MỤC CƠ BẢN
 # ==========================================
+def bootstrap_transactional_schema():
+    """Create the OLTP tables that Debezium and the stream simulator require."""
+    if not cursor:
+        return
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS "Applicant" (
+            id VARCHAR(20) PRIMARY KEY,
+            identity_num VARCHAR(50), name VARCHAR(255), email VARCHAR(255),
+            phone VARCHAR(50), password VARCHAR(255), "Provinceid" INT,
+            "Wardid" INT, updated_at TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS "Application" (
+            id VARCHAR(20) PRIMARY KEY,
+            name VARCHAR(500), created_at TIMESTAMP NOT NULL,
+            "Applicantid" VARCHAR(20), "Statusid" INT, "Serviceid" INT,
+            "Agencyid" INT, updated_at TIMESTAMP NOT NULL
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS "Application_History" (
+            id VARCHAR(20) PRIMARY KEY,
+            "Applicationid" VARCHAR(20) NOT NULL, "Statusid" INT,
+            "Statusid2" INT NOT NULL, "Officerid" INT, action_time TIMESTAMP NOT NULL,
+            note VARCHAR(1000)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS "Document" (
+            id VARCHAR(20) PRIMARY KEY,
+            name VARCHAR(500), "Applicationid" VARCHAR(20) NOT NULL,
+            file_url VARCHAR(1000), "Document_Typeid" INT
+        )
+    ''')
+    conn.commit()
+    print("Transactional CDC schema is ready.")
+
+
+bootstrap_transactional_schema()
+
 status_data = [
     {'id': 1, 'code': 'RECEIVED', 'name': 'Mới tiếp nhận', 'description': 'Hồ sơ đã nộp thành công'},
     {'id': 2, 'code': 'ASSIGNED', 'name': 'Đã phân công', 'description': 'Lãnh đạo đã giao hồ sơ'},

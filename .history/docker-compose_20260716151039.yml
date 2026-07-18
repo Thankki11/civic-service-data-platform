@@ -14,11 +14,6 @@ services:
       - spark-network
     volumes:
       - source_db_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U source_db -d source_db"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
 
   minio:
     image: minio/minio
@@ -33,22 +28,6 @@ services:
       MINIO_ROOT_USER: minio_access_key
       MINIO_ROOT_PASSWORD: minio_secret_key
     command: server --console-address ":9001" /data
-    networks:
-      - spark-network
-
-  # Khoi tao bucket ma Bronze/Silver/Gold va Quarantine su dung. Spark/Iceberg
-  # khong tu tao bucket S3, nen day la precondition bat buoc.
-  minio-init:
-    image: minio/mc:latest
-    container_name: minio-init
-    depends_on:
-      - minio
-    entrypoint: >
-      /bin/sh -c "until mc alias set local http://minio:9000 minio_access_key minio_secret_key;
-      do sleep 2; done;
-      mc mb --ignore-existing local/landing-zone;
-      mc mb --ignore-existing local/lakehouse;
-      mc mb --ignore-existing local/quarantine-zone;"
     networks:
       - spark-network
 
@@ -109,7 +88,7 @@ services:
       - "4040:4040"
       - "8888:8888"
     volumes:
-      - .:/opt/spark-data
+      - K:\Data_Platform:/opt/spark-data
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     networks:
       - spark-network
@@ -120,7 +99,7 @@ services:
     ports:
       - "8081:8081"
     volumes:
-      - .:/opt/spark-data
+      - K:\Data_Platform:/opt/spark-data
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     depends_on:
       - spark-master
@@ -133,7 +112,7 @@ services:
     ports:
       - "8082:8081" # Map cổng 8082 (máy ngoài) vào cổng 8081 (nội bộ container)
     volumes:
-      - .:/opt/spark-data
+      - K:\Data_Platform:/opt/spark-data
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     depends_on:
       - spark-master
@@ -147,7 +126,7 @@ services:
     ports:
       - "8083:8081"
     volumes:
-      - .:/opt/spark-data
+      - K:\Data_Platform:/opt/spark-data
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     depends_on:
       - spark-master
@@ -155,7 +134,7 @@ services:
       - spark-network
 
   nifi:
-    image: apache/nifi:1.25.0
+    image: apache/nifi:latest
     container_name: nifi
     ports:
       - "8443:8443"
@@ -164,12 +143,6 @@ services:
       - SINGLE_USER_CREDENTIALS_PASSWORD=adminadminadmin
     networks:
       - spark-network
-    volumes:
-      - K:\Data_Platform\nifi_extensions\nifi-iceberg-processors-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-iceberg-processors-nar-1.25.0.nar
-      - K:\Data_Platform\nifi_extensions\nifi-iceberg-services-api-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-iceberg-services-api-nar-1.25.0.nar
-      - K:\Data_Platform\nifi_extensions\nifi-iceberg-services-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-iceberg-services-nar-1.25.0.nar
-      - K:\Data_Platform\nifi_extensions\nifi-hive-services-api-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-hive-services-api-nar-1.25.0.nar
-      - K:\Data_Platform\nifi_core_site.xml:/opt/nifi/nifi-current/conf/core-site.xml
 
   metastore-db:
     image: postgres:11
@@ -236,7 +209,6 @@ services:
       - kafka
 
   mock-api:
-    image: civic-service-data-platform-python:latest
     build:
       context: .
       dockerfile: Dockerfile.python
@@ -247,20 +219,18 @@ services:
     networks:
       - spark-network
     volumes:
-      - ./data-generator:/app
+      - K:\Data_Platform\data-generator:/app
 
   stream-simulator:
-    image: civic-service-data-platform-python:latest
     build:
       context: .
       dockerfile: Dockerfile.python
     container_name: stream-simulator
-    profiles: ["streaming"]
     command: ["python", "data_stream_simulator.py"]
     networks:
       - spark-network
     volumes:
-      - ./data-generator:/app
+      - K:\Data_Platform\data-generator:/app
     environment:
       - PYTHONIOENCODING=utf-8
       - DB_HOST=source_db
@@ -270,7 +240,6 @@ services:
       - kafka
 
   data-master-gen:
-    image: civic-service-data-platform-python:latest
     build:
       context: .
       dockerfile: Dockerfile.python
@@ -280,12 +249,11 @@ services:
     networks:
       - spark-network
     volumes:
-      - ./:/app
+      - K:\Data_Platform:/app
     depends_on:
       - source_db
 
   data-transactional-gen:
-    image: civic-service-data-platform-python:latest
     build:
       context: .
       dockerfile: Dockerfile.python
@@ -295,7 +263,7 @@ services:
     networks:
       - spark-network
     volumes:
-      - ./:/app
+      - K:\Data_Platform:/app
     environment:
       - MINIO_ENDPOINT=http://minio:9000
       - PYTHONIOENCODING=utf-8
@@ -310,4 +278,4 @@ volumes:
 
 networks:
   spark-network:
-    driver: bridge
+    external: true

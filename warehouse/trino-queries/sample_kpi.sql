@@ -1,15 +1,18 @@
--- SQL toi uu tren Trino Query Engine — Trung
--- Nguyen tac (theo bang action items):
---   * Han che join qua nang
---   * Tan dung partition (loc theo date_key truoc)
---   * Chi select cot can thiet
-
+-- Leadership KPI by month. The thoi_gian_id predicate enables Iceberg
+-- partition pruning before joining the small calendar dimension.
 SELECT
-    d.year,
-    d.month,
-    SUM(f.total_amount) AS revenue
-FROM iceberg.gold.fact_main f
-JOIN iceberg.gold.dim_date d ON f.date_key = d.date_key
-WHERE f.date_key >= 20260701          -- partition pruning
-GROUP BY d.year, d.month
-ORDER BY d.year, d.month;
+    d.nam,
+    d.thang,
+    SUM(f.so_luong_tiep_nhan) AS tong_tiep_nhan,
+    SUM(f.tong_chi_phi) AS tong_doanh_thu_vnd,
+    SUM(f.so_luong_ton_dong) AS tong_ton_dong,
+    100.0 * SUM(f.so_luong_tre_han)
+        / NULLIF(SUM(f.so_luong_tiep_nhan) + SUM(f.so_luong_ton_dong), 0) AS ty_le_tre_han_pct,
+    100.0 * SUM(f.so_luong_rework)
+        / NULLIF(SUM(f.so_luong_tiep_nhan), 0) AS ty_le_rework_pct
+FROM iceberg.gold.fact_van_hanh_co_quan f
+JOIN iceberg.gold.dim_thoi_gian d
+    ON d.thoi_gian_id = f.thoi_gian_id
+WHERE f.thoi_gian_id BETWEEN 20260701 AND 20260731
+GROUP BY 1, 2
+ORDER BY 1, 2;

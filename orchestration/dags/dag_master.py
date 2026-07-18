@@ -42,7 +42,7 @@ with DAG(
     validate_gold = TrinoOperator(
         task_id="validate_gold_not_empty",
         trino_conn_id="trino_default",
-        sql="SELECT count(*) FROM iceberg.gold.fact_main",
+        sql="SELECT count(*) FROM iceberg.gold.fact_van_hanh_co_quan",
     )
 
     run_ingestion >> run_transform >> validate_gold
