@@ -60,6 +60,12 @@ def create_silver_table(df, table_name):
         USING iceberg
         LOCATION 's3a://lakehouse/warehouse/silver/{table_name}'
     """)
+    existing_columns = {field.name.lower() for field in spark.table(full_name).schema.fields}
+    for field in df.schema.fields:
+        if field.name.lower() not in existing_columns:
+            spark.sql(
+                f"ALTER TABLE {full_name} ADD COLUMN `{field.name}` {field.dataType.simpleString()}"
+            )
     return full_name
 
 
@@ -165,7 +171,8 @@ bronze_cdc_document = read_optional_bronze(CDC_DOCUMENT)
 bronze_cdc_applicant = read_optional_bronze(CDC_APPLICANT)
 
 
-# Danh muc chi co nguon Bronze master, do do khong lien quan den XML fallback.
+# Danh muc chi co nguon Bronze master. Bronze giu nhieu snapshot, Silver chi
+# giu snapshot moi nhat kem metadata de Gold SCD2 biet thoi diem phat hien.
 MASTER_TABLES = [
     "province", "ward", "status", "service", "agency", "role", "permission",
     "document_type", "officer", "officer_role",
@@ -176,10 +183,41 @@ for table in MASTER_TABLES:
         print(f"[!] Khong tim thay {source}; giu nguyen silver.{table}.")
         continue
     master = spark.table(source)
+    snapshot_id_col = (
+        F.col("snapshot_id") if "snapshot_id" in master.columns else F.lit(None).cast("string")
+    )
+    snapshot_order = F.coalesce(
+        snapshot_id_col,
+        F.date_format(F.col("ingested_at"), "yyyyMMddHHmmssSSSSSS"),
+    )
+    master = (
+        master
+        .withColumn("_snapshot_rank", F.dense_rank().over(Window.orderBy(snapshot_order.desc_nulls_last())))
+        .filter("_snapshot_rank = 1")
+        .drop("_snapshot_rank")
+    )
     for column in [field.name for field in master.schema.fields if field.dataType.simpleString() == "string"]:
         master = master.withColumn(column, F.trim(F.col(column)))
-    master = master.drop(*[column for column in ("ingested_at", "file_name") if column in master.columns])
-    replace_master_snapshot(master.dropDuplicates(["id"]), table)
+    master = (
+        master
+        .withColumnRenamed("ingested_at", "source_snapshot_at")
+        .withColumn(
+            "source_snapshot_id",
+            F.col("snapshot_id") if "snapshot_id" in master.columns else F.lit(None).cast("string"),
+        )
+        .drop(*[column for column in ("snapshot_id",) if column in master.columns])
+        .drop(*[column for column in ("file_name",) if column in master.columns])
+    )
+    # Snapshot master phai unique theo business key. Chi bo cac dong trung
+    # hoan toan; neu cung id ma khac noi dung, dung job de khong mo SCD2 sai.
+    master = master.dropDuplicates()
+    conflicting_keys = master.groupBy("id").count().filter(F.col("count") > 1)
+    if conflicting_keys.limit(1).count() > 0:
+        examples = [row["id"] for row in conflicting_keys.limit(10).collect()]
+        raise ValueError(
+            f"Bronze master {table} co business key trung voi noi dung khac: {examples}"
+        )
+    replace_master_snapshot(master, table)
 
 
 # APPLICATION: union XML + CDC. Cac ID mau khong giao nhau; source_priority
@@ -187,6 +225,7 @@ for table in MASTER_TABLES:
 xml_application = None
 if bronze_xml is not None:
     xml_application = bronze_xml.select(
+        F.concat(F.lit("XML_"), F.col("ma_goi_tin")).alias("event_id"),
         F.col("id_ban_ghi").alias("ho_so_id"),
         F.get_json_object("data_payload", "$.name").alias("ten_ho_so"),
         F.get_json_object("data_payload", "$.Applicantid").alias("applicant_id"),
@@ -202,6 +241,20 @@ if bronze_xml is not None:
 cdc_application = None
 if bronze_cdc_application is not None:
     cdc_application = bronze_cdc_application.select(
+        F.concat(
+            F.lit("CDC_"),
+            F.sha2(
+                F.concat_ws(
+                    "\u001f",
+                    F.col("id"),
+                    F.col("updated_at").cast("string"),
+                    F.col("Statusid").cast("string"),
+                    F.col("Serviceid").cast("string"),
+                    F.col("Agencyid").cast("string"),
+                ),
+                256,
+            ),
+        ).alias("event_id"),
         F.col("id").alias("ho_so_id"), F.col("name").alias("ten_ho_so"),
         F.col("Applicantid").alias("applicant_id"), F.col("Serviceid").alias("dv_cong_id"),
         F.col("Agencyid").alias("co_quan_id"), F.col("created_at"),
@@ -212,13 +265,18 @@ if bronze_cdc_application is not None:
 
 application_events = union_available(xml_application, cdc_application)
 if application_events is not None:
+    # Application current-state khong du de backfill Gold. Luu event stream
+    # rieng de co the tai dung version cua ho so tai mot cutoff qua khu.
+    append_new_events(application_events, "application_event", ["event_id"])
     application_events = application_events.repartition(N_PART, "ho_so_id")
     forward = Window.partitionBy("ho_so_id").orderBy("event_time", "source_priority").rowsBetween(
         Window.unboundedPreceding, Window.currentRow
     )
     for column in ["ten_ho_so", "applicant_id", "dv_cong_id", "co_quan_id", "created_at", "trang_thai_id"]:
         application_events = application_events.withColumn(column, F.last(column, ignorenulls=True).over(forward))
-    application = latest(application_events, "ho_so_id", "event_time", "source_priority").drop("source_priority")
+    application = latest(application_events, "ho_so_id", "event_time", "source_priority").drop(
+        "source_priority", "event_id"
+    )
     merge_current_state(application, "application", ["ho_so_id"])
 
 

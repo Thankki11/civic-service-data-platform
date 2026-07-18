@@ -28,10 +28,12 @@ Nhóm chỉ số này dùng để phân tích chuyên sâu (Drill-down) tìm ngu
 
 ## 3. Các chiều Phân tích (Dimensions)
 
-Để cắt lớp (Slicing/Dicing) các chỉ số trên, Superset sẽ kết hợp (JOIN) các bảng Fact với các bảng Dimension theo khóa chính (`INT`):
+Để cắt lớp (Slicing/Dicing), batch Iceberg dùng SCD Type 2 cho cơ quan, trạng thái, cán bộ và dịch vụ. Fact lưu surrogate key version (`dim_*_sk`) và BI phải join theo surrogate key; không join natural key đơn thuần vì có thể nhân dòng qua nhiều version.
 
-*   **Theo Cơ quan:** Drill-down hiệu suất từ toàn hệ thống xuống từng đơn vị thông qua `gold.dim_co_quan USING (co_quan_id)`.
+*   **Theo Cơ quan:** `fact_ton_dong_ho_so.dim_co_quan_sk = dim_co_quan.dim_co_quan_sk`; `fact_van_hanh_co_quan` cũng có `dim_co_quan_sk`.
 *   **Theo Thời gian:** Xem xét xu hướng lịch sử qua `gold.dim_thoi_gian USING (thoi_gian_id)`.
-*   **Theo Trạng thái:** Phân tích điểm nghẽn quy trình qua `gold.dim_trang_thai USING (trang_thai_id)`.
-*   **Theo Nhân sự:** Đánh giá năng lực giải quyết của cá nhân qua `gold.dim_can_bo USING (can_bo_id)`. *(Lưu ý: Job ETL cần set mặc định `can_bo_id = -1` (Unknown) đối với các hồ sơ mới nộp vào luồng chờ phân công để tránh lỗi JOIN rỗng).*
-*   **Theo Thủ tục:** Đo lường mức độ phức tạp của từng loại dịch vụ qua `gold.dim_dich_vu_cong USING (dv_cong_id)`.
+*   **Theo Trạng thái:** `fact_ton_dong_ho_so.dim_trang_thai_sk = dim_trang_thai.dim_trang_thai_sk`.
+*   **Theo Nhân sự:** `fact_ton_dong_ho_so.dim_can_bo_sk = dim_can_bo.dim_can_bo_sk`. *(Với hồ sơ chưa phân công, ETL dùng member Unknown `can_bo_id = -1`.)*
+*   **Theo Thủ tục:** `fact_ton_dong_ho_so.dim_dich_vu_cong_sk = dim_dich_vu_cong.dim_dich_vu_cong_sk`; SLA dùng version có hiệu lực khi tiếp nhận.
+
+StarRocks realtime giữ dimension Type 1 theo natural key để broadcast join với Materialized View; không dùng các surrogate key SCD2 này.

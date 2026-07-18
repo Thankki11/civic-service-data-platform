@@ -29,8 +29,8 @@ Hai đường cùng dùng các khóa nghiệp vụ `ho_so_id`, `co_quan_id`, `dv
 |---|---:|---|---|
 | `silver.application` | 1 dòng / hồ sơ | XML + CDC | Hợp nhất hai tập hồ sơ bổ sung trong data mẫu; chọn version mới nhất theo `event_time`. |
 | `silver.application_history` | 1 dòng / hành động | XML + CDC | Nhật ký bất biến, union hai input rồi append chống trùng theo `history_id`. |
-| `gold.fact_ton_dong_ho_so` | 1 dòng / hồ sơ mở / ngày | Silver application + history | Snapshot backlog ở 23:59:59. |
-| `gold.fact_van_hanh_co_quan` | 1 dòng / cơ quan / ngày | Các fact/nguồn Silver | KPI lãnh đạo. |
+| `gold.fact_ton_dong_ho_so` | 1 dòng / hồ sơ mở / ngày | Silver application + history + dim SCD2 | Snapshot backlog ở 23:59:59, mang surrogate key version của dim. |
+| `gold.fact_van_hanh_co_quan` | 1 dòng / cơ quan / ngày | Các fact/nguồn Silver + dim SCD2 | KPI lãnh đạo và version cơ quan tại ngày chốt. |
 | `gold_realtime.fact_xu_ly_ho_so` | 1 dòng / hành động | StarRocks ODS history + application | Duration từng bước xử lý realtime. |
 
 Trạng thái: `RECEIVED(1) -> ASSIGNED(2) -> PROCESSING(3) -> PENDING_APPROVAL(4) -> APPROVED(5) -> READY(6) -> COMPLETED(7)`; `REJECTED(8)` là trạng thái kết thúc.
@@ -118,6 +118,17 @@ docker exec spark-master /opt/spark/bin/spark-submit `
 
 Job chốt số cho **hôm qua**. Hai Gold fact là periodic snapshot: job thay thế nguyên partition `thoi_gian_id` của ngày đang chốt bằng atomic Iceberg overwrite. Cách này idempotent khi chạy lại và cũng xóa dòng backlog cũ nếu hồ sơ đã đóng sau khi tính lại; các partition ngày khác không bị ảnh hưởng.
 
+Backfill chạy từng ngày để mỗi lần ghi là một Iceberg commit atomic và dễ retry:
+
+```powershell
+docker exec spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 `
+  /opt/spark-data/transform/spark-agg/silver_to_gold.py `
+  --snapshot-date 2026-07-15
+```
+
+Khi backfill, `Application` chỉ dùng cho các thuộc tính bất biến (`created_at`, `co_quan_id`, `dv_cong_id`...). Trạng thái mở/đóng của hồ sơ luôn là event mới nhất trong `Application_History` không vượt quá `23:59:59` của ngày backfill; vì vậy `Statusid` hiện tại trong `Application` không làm sai snapshot quá khứ. Backfill dùng để tạo/điều chỉnh ảnh chụp Gold cho ngày quá khứ khi Bronze/Silver đã nhận dữ liệu muộn, không phải để sinh thêm dữ liệu hằng ngày.
+
 ### 5.6 Tạo Routine Load realtime
 
 ```powershell
@@ -169,11 +180,12 @@ File này xây cả Iceberg Gold và StarRocks dimensions trong cùng một lầ
 
 - `dim_thoi_gian`: date spine demo 2023–2028, thứ/ngày/tháng/quý/năm, cờ nghỉ và `stt_ngay_lam_viec` tích lũy.
 - `stt_ngay_lam_viec` là kỹ thuật quan trọng: thay vì join mọi ngày trong một khoảng thời gian, số ngày làm việc = `seq_ngày_kết_thúc - seq_ngày_bắt_đầu`.
-- `dim_co_quan`: Agency join Province/Ward bằng Spark broadcast.
-- `dim_trang_thai`: map id/code/name.
-- `dim_can_bo`: Officer join Officer_Role/Role, chọn một role đại diện và thêm member `-1`.
-- `dim_dich_vu_cong`: Service, trong đó `processing_time` trở thành SLA `thoi_han_tra_kq`.
-- Ghi StarRocks bằng JDBC append vào Primary Key table, nên cùng key sẽ upsert. Vì dimension nhỏ, dữ liệu được `coalesce(1)`, ghi theo batch 1.000 dòng và bật `rewriteBatchedStatements`; nếu không, MySQL JDBC có thể biến một batch thành hàng nghìn `INSERT` đơn lẻ, làm StarRocks chạm giới hạn phiên bản tablet.
+- `dim_co_quan`: Agency join Province/Ward bằng Spark broadcast; Iceberg Gold lưu SCD2 theo thay đổi tên/địa bàn.
+- `dim_trang_thai`: map id/code/name, có version SCD2 để không đổi nhãn lịch sử nếu danh mục bị sửa.
+- `dim_can_bo`: Officer join Officer_Role/Role, chọn một role đại diện, thêm member `-1`, và lưu SCD2 khi tên/vị trí đổi.
+- `dim_dich_vu_cong`: Service, trong đó `processing_time` trở thành SLA `thoi_han_tra_kq`; đây là SCD2 quan trọng nhất.
+- Iceberg batch dùng SCD2 (`*_sk`, `effective_from_ts`, `effective_to_ts`, `is_current`, `record_hash`). StarRocks giữ Type 1 current-state trong Primary Key table để MV realtime broadcast join nhanh.
+- Vì dimension nhỏ, JDBC ghi theo `coalesce(1)`, batch 1.000 dòng và `rewriteBatchedStatements`.
 
 ### `spark-agg/silver_to_gold.py`
 
@@ -191,12 +203,13 @@ File này xây cả Iceberg Gold và StarRocks dimensions trong cùng một lầ
 - `so_ngay_ton_dong_hien_tai`: ngày làm việc từ action gần nhất đến cutoff.
 - `tong_thoi_gian_da_xu_ly`: ngày làm việc từ lúc tiếp nhận đến cutoff.
 - `can_bo_id`: officer ở action gần nhất; nếu chưa có là `-1`.
+- Fact lưu thêm `dim_trang_thai_sk`, `dim_co_quan_sk`, `dim_can_bo_sk`, `dim_dich_vu_cong_sk` để BI join đúng version dimension.
 
 **`fact_van_hanh_co_quan`**
 
 - Base từ toàn bộ Agency để mỗi cơ quan luôn có một dòng, kể cả ngày không phát sinh.
 - `so_luong_tiep_nhan`: Application có `created_at` trong ngày.
-- Đúng/trễ hạn: chỉ event COMPLETED trong ngày; SLA = ngày làm việc từ created đến completed so với `Service.processing_time`.
+- Đúng/trễ hạn: chỉ event COMPLETED trong ngày; SLA = ngày làm việc từ created đến completed so với version `dim_dich_vu_cong` có hiệu lực khi tiếp nhận.
 - Trễ hạn cuối cùng = completed trễ + hồ sơ còn mở đã quá SLA tại cutoff.
 - Backlog lấy trực tiếp từ `fact_ton_dong_ho_so`, tránh hai công thức backlog khác nhau.
 - Payment SUCCESS đóng góp `tong_chi_phi`.
@@ -248,7 +261,7 @@ WHERE thoi_gian_id >= 20260701;
 
 ## 8. Giới hạn đang được ghi nhận
 
-1. XML payload hiện có cấu trúc lồng `application_history_array.application_history`, `document_array.document`, `payment_array.payment`; parser Silver đang chờ mảng trực tiếp. XML contribution cần sửa riêng trước khi bật cho dữ liệu thật. CDC-only vẫn chạy được.
+1. Bronze master phải chạy snapshot ít nhất hai lần để SCD2 có thể phát hiện thay đổi. Lần migrate đầu tiên bootstrap version hiện có từ `2023-01-01`; không thể khôi phục business-effective date trước khi pipeline bắt đầu lưu snapshot.
 2. `dim_thoi_gian` mới có cuối tuần và ngày lễ dương cố định. KPI SLA chỉ hoàn toàn chính xác khi bổ sung lịch nghỉ Tết/hoán đổi ngày làm việc chính thức.
 3. Rework chưa có event nghiệp vụ riêng; REJECTED chỉ là proxy demo.
 4. Agency và Service được xem là bất biến sau khi hồ sơ được tạo. Nếu nghiệp vụ cho phép đổi hai thuộc tính này, cần snapshot chúng vào history hoặc xây SCD để không gán lại lịch sử theo giá trị hiện tại.

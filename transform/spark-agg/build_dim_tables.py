@@ -29,6 +29,7 @@ STARROCKS_JDBC_URL = (
 )
 STARROCKS_USER = "root"
 STARROCKS_PASSWORD = ""
+SCD_BASELINE_TS = "2023-01-01 00:00:00"
 
 spark = (
     SparkSession.builder
@@ -104,6 +105,153 @@ def save_dim(df, table_name, key_cols):
     print(f"[+] dim.{table_name} <- da ghi vao Iceberg (gold.{table_name}) va StarRocks (gold_realtime.{table_name})")
 
 
+def write_current_dim_to_starrocks(df, table_name):
+    """StarRocks realtime chi can Type 1/current-state de MV join nhanh."""
+    (
+        df.coalesce(1).write.format("jdbc")
+        .option("url", STARROCKS_JDBC_URL)
+        .option("dbtable", table_name)
+        .option("user", STARROCKS_USER)
+        .option("password", STARROCKS_PASSWORD)
+        .option("driver", "com.mysql.cj.jdbc.Driver")
+        .option("batchsize", "1000")
+        .mode("append")
+        .save()
+    )
+
+
+def save_dim_scd2(df, table_name, business_key, tracked_columns):
+    """Luu SCD Type 2 trong Iceberg Gold va mirror Type 1 vao StarRocks.
+
+    `df` la full snapshot danh muc hien tai tu Silver. Moi thay doi cua cac
+    tracked column dong version current cu va tao version moi. `source_snapshot`
+    duoc giu tu Bronze master; do do effective_from la luc snapshot duoc ingest,
+    khong phai luc job dimension tinh lai.
+    """
+    sk_column = f"{table_name}_sk"
+    source_meta = {"source_snapshot_at", "source_snapshot_id"}
+    base_columns = [column for column in df.columns if column not in source_meta]
+    full_name = f"{CATALOG}.gold.{table_name}"
+
+    # Day la full snapshot append tu Bronze. Loai dong trung hoan toan truoc
+    # khi tinh hash; mot business key lap lai voi gia tri khac trong CUNG
+    # snapshot la loi nguon, khong duoc dropDuplicates([key]) mot cach tuy y.
+    snapshot = df.dropDuplicates()
+    conflicting_keys = snapshot.groupBy(business_key).count().filter(F.col("count") > 1)
+    if conflicting_keys.limit(1).count() > 0:
+        examples = [row[business_key] for row in conflicting_keys.limit(10).collect()]
+        raise ValueError(
+            f"silver snapshot {table_name} co business key trung voi noi dung khac: {examples}"
+        )
+
+    hash_parts = [
+        F.coalesce(F.col(column).cast("string"), F.lit("<NULL>"))
+        for column in tracked_columns
+    ]
+    source = (
+        snapshot
+        .withColumn("effective_from_ts", F.coalesce(F.col("source_snapshot_at"), F.current_timestamp()))
+        .withColumn(
+            "source_snapshot_id",
+            F.coalesce(
+                F.col("source_snapshot_id"),
+                F.date_format(F.col("effective_from_ts"), "yyyyMMddHHmmssSSSSSS"),
+            ),
+        )
+        .withColumn("record_hash", F.sha2(F.concat_ws("\u001f", *hash_parts), 256))
+        .withColumn(sk_column, F.xxhash64(F.col(business_key), F.col("source_snapshot_id")))
+        .withColumn("effective_to_ts", F.lit(None).cast("timestamp"))
+        .withColumn("is_current", F.lit(True))
+        .select(
+            sk_column, *base_columns, "effective_from_ts", "effective_to_ts",
+            "is_current", "source_snapshot_id", "record_hash",
+        )
+    )
+    output_columns = source.columns
+    schema_sql = ", ".join(f"`{field.name}` {field.dataType.simpleString()}" for field in source.schema.fields)
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {full_name} ({schema_sql})
+        USING iceberg
+        LOCATION 's3a://lakehouse/warehouse/gold/{table_name}'
+    """)
+
+    # Evolve Type 1 tables created by previous versions of the demo.
+    existing_columns = {field.name.lower() for field in spark.table(full_name).schema.fields}
+    for field in source.schema.fields:
+        if field.name.lower() not in existing_columns:
+            spark.sql(f"ALTER TABLE {full_name} ADD COLUMN `{field.name}` {field.dataType.simpleString()}")
+
+    target = spark.table(full_name)
+    # Lan dau chuyen tu Type 1 sang Type 2 khong co moc thay doi lich su. Dat
+    # version baseline tu dau calendar demo de fact 2023-2028 join duoc; cac
+    # thay doi phat hien o snapshot sau dung source_snapshot_at thuc te.
+    is_initial_scd_load = target.filter(F.col("effective_from_ts").isNotNull()).limit(1).count() == 0
+    if is_initial_scd_load:
+        source = source.withColumn("effective_from_ts", F.lit(SCD_BASELINE_TS).cast("timestamp"))
+        target = spark.createDataFrame([], source.schema)
+    else:
+        target = (
+            target
+            .withColumn("effective_from_ts", F.coalesce(F.col("effective_from_ts"), F.current_timestamp()))
+            .withColumn("effective_to_ts", F.col("effective_to_ts").cast("timestamp"))
+            .withColumn("is_current", F.coalesce(F.col("is_current"), F.lit(True)))
+            .withColumn("source_snapshot_id", F.coalesce(F.col("source_snapshot_id"), F.lit("legacy")))
+            .withColumn("record_hash", F.sha2(F.concat_ws("\u001f", *hash_parts), 256))
+            .withColumn(
+                sk_column,
+                F.coalesce(F.col(sk_column), F.xxhash64(F.col(business_key), F.col("source_snapshot_id"))),
+            )
+            .select(*output_columns)
+        )
+        # Dimension la bang nho. Tach scan Iceberg thanh DataFrame noi bo
+        # truoc khi loc is_current/ghi de cung bang. Spark 3.5 co assertion
+        # loi khi push predicate boolean vao V2 Iceberg scan trong read-write
+        # plan cua cung mot bang.
+        target = spark.createDataFrame(target.collect(), schema=target.schema)
+
+    current = target.filter(F.col("is_current"))
+    historical = target.filter(~F.col("is_current"))
+    current_ref = current.select(business_key, F.col("record_hash").alias("_current_hash"))
+    source_ref = source.select(
+        business_key,
+        F.col("record_hash").alias("_source_hash"),
+        F.col("effective_from_ts").alias("_new_effective_from"),
+    )
+
+    unchanged = (
+        current.alias("t")
+        .join(source_ref.alias("s"), business_key, "inner")
+        .filter(F.col("t.record_hash") == F.col("s._source_hash"))
+        .select(*[F.col(f"t.`{column}`").alias(column) for column in output_columns])
+    )
+    expired = (
+        current.alias("t")
+        .join(source_ref.alias("s"), business_key, "left")
+        .filter(F.col("s._source_hash").isNull() | (F.col("t.record_hash") != F.col("s._source_hash")))
+        .select(
+            *[F.col(f"t.`{column}`").alias(column) for column in output_columns if column not in {"effective_to_ts", "is_current"}],
+            F.coalesce(F.col("s._new_effective_from"), F.current_timestamp()).alias("effective_to_ts"),
+            F.lit(False).alias("is_current"),
+        )
+        .select(*output_columns)
+    )
+    new_current = (
+        source.alias("s")
+        .join(current_ref.alias("t"), business_key, "left")
+        .filter(F.col("t._current_hash").isNull() | (F.col("s.record_hash") != F.col("t._current_hash")))
+        .select(*[F.col(f"s.`{column}`").alias(column) for column in output_columns])
+    )
+
+    # Dimension nho: rebuild toan bo SCD table tu historical + current state
+    # trong mot Iceberg overwrite atomic, tranh trang thai nua dong/nua mo.
+    scd_result = historical.unionByName(expired).unionByName(unchanged).unionByName(new_current)
+    scd_result.writeTo(full_name).overwrite(F.lit(True))
+
+    # Realtime khong mang lich su dim: chi nap snapshot Type 1 hien tai.
+    write_current_dim_to_starrocks(source.select(*base_columns), table_name)
+    print(f"[+] gold.{table_name} <- SCD2 Iceberg; gold_realtime.{table_name} <- Type1 current")
+
+
 # ---------------------------------------------------------------------------
 # 1. DIM_THOI_GIAN - date spine sinh bang Spark (khong can bang nguon)
 #    co_phai_la_ngay_nghi = Thu 7/CN HOAC nam trong danh sach ngay le co dinh
@@ -165,9 +313,11 @@ dim_co_quan = (
         F.col("name").alias("ten"),
         F.col("tinh"),
         F.col("phuong"),
+        F.col("source_snapshot_at"),
+        F.col("source_snapshot_id"),
     )
 )
-save_dim(dim_co_quan, "dim_co_quan", ["co_quan_id"])
+save_dim_scd2(dim_co_quan, "dim_co_quan", "co_quan_id", ["ten", "tinh", "phuong"])
 
 
 # ---------------------------------------------------------------------------
@@ -179,9 +329,11 @@ dim_trang_thai = (
         F.col("id").alias("trang_thai_id"),
         F.col("code").alias("ma_trang_thai"),
         F.col("name").alias("ten_trang_thai"),
+        F.col("source_snapshot_at"),
+        F.col("source_snapshot_id"),
     )
 )
-save_dim(dim_trang_thai, "dim_trang_thai", ["trang_thai_id"])
+save_dim_scd2(dim_trang_thai, "dim_trang_thai", "trang_thai_id", ["ma_trang_thai", "ten_trang_thai"])
 
 
 # ---------------------------------------------------------------------------
@@ -213,13 +365,16 @@ dim_can_bo_real = (
         F.col("id").alias("can_bo_id"),
         F.col("name").alias("ten"),
         F.coalesce(F.col("vi_tri"), F.lit("Chua xac dinh vai tro")).alias("vi_tri"),
+        F.col("source_snapshot_at"),
+        F.col("source_snapshot_id"),
     )
 )
 dim_can_bo_unknown = spark.createDataFrame(
-    [(-1, "Khong xac dinh", "N/A")], schema="can_bo_id int, ten string, vi_tri string"
+    [(-1, "Khong xac dinh", "N/A", None, "SYSTEM")],
+    schema="can_bo_id int, ten string, vi_tri string, source_snapshot_at timestamp, source_snapshot_id string",
 )
 dim_can_bo = dim_can_bo_real.unionByName(dim_can_bo_unknown)
-save_dim(dim_can_bo, "dim_can_bo", ["can_bo_id"])
+save_dim_scd2(dim_can_bo, "dim_can_bo", "can_bo_id", ["ten", "vi_tri"])
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +386,16 @@ dim_dich_vu_cong = (
         F.col("id").alias("dv_cong_id"),
         F.col("name").alias("ten"),
         F.col("processing_time").alias("thoi_han_tra_kq"),
+        F.col("source_snapshot_at"),
+        F.col("source_snapshot_id"),
     )
 )
-save_dim(dim_dich_vu_cong, "dim_dich_vu_cong", ["dv_cong_id"])
+save_dim_scd2(
+    dim_dich_vu_cong,
+    "dim_dich_vu_cong",
+    "dv_cong_id",
+    ["ten", "thoi_han_tra_kq"],
+)
 
 print("[+] Hoan tat build 5 bang dim (Iceberg + StarRocks).")
 spark.stop()

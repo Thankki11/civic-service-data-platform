@@ -18,28 +18,52 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_thoi_gian (
 ) USING iceberg;
 
 CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_co_quan (
+    dim_co_quan_sk         BIGINT COMMENT 'Surrogate key version SCD2',
     co_quan_id            INT,
     ten    STRING,
     tinh   STRING,
-    phuong   STRING
+    phuong   STRING,
+    effective_from_ts TIMESTAMP,
+    effective_to_ts   TIMESTAMP COMMENT 'Moc ket thuc doc quyen, NULL neu current',
+    is_current        BOOLEAN,
+    source_snapshot_id STRING,
+    record_hash       STRING
 ) USING iceberg;
 
 CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_trang_thai (
+    dim_trang_thai_sk BIGINT COMMENT 'Surrogate key version SCD2',
     trang_thai_id INT,
     ma_trang_thai STRING,
-    ten_trang_thai STRING
+    ten_trang_thai STRING,
+    effective_from_ts TIMESTAMP,
+    effective_to_ts   TIMESTAMP,
+    is_current        BOOLEAN,
+    source_snapshot_id STRING,
+    record_hash       STRING
 ) USING iceberg;
 
 CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_can_bo (
+    dim_can_bo_sk BIGINT COMMENT 'Surrogate key version SCD2',
     can_bo_id INT,
     ten STRING,
-    vi_tri STRING
+    vi_tri STRING,
+    effective_from_ts TIMESTAMP,
+    effective_to_ts   TIMESTAMP,
+    is_current        BOOLEAN,
+    source_snapshot_id STRING,
+    record_hash       STRING
 ) USING iceberg;
 
 CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_dich_vu_cong (
+    dim_dich_vu_cong_sk BIGINT COMMENT 'Surrogate key version SCD2',
     dv_cong_id INT,
     ten STRING,
-    thoi_han_tra_kq INT
+    thoi_han_tra_kq INT,
+    effective_from_ts TIMESTAMP,
+    effective_to_ts   TIMESTAMP,
+    is_current        BOOLEAN,
+    source_snapshot_id STRING,
+    record_hash       STRING
 ) USING iceberg;
 
 -- ---------------------------------------------------------------------------
@@ -73,9 +97,13 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.fact_ton_dong_ho_so (
     id                        BIGINT,
     ho_so_id                  STRING,
     trang_thai_id             INT,
+    dim_trang_thai_sk         BIGINT,
     co_quan_id                INT,
+    dim_co_quan_sk            BIGINT,
     can_bo_id                 INT,
+    dim_can_bo_sk             BIGINT,
     dv_cong_id                INT,
+    dim_dich_vu_cong_sk       BIGINT,
     so_ngay_ton_dong_hien_tai INT COMMENT 'So ngay ngam tai trang thai hien tai',
     tong_thoi_gian_da_xu_ly   INT COMMENT 'Tuoi ho so tinh tu luc tiep nhan',
     so_luong                  INT COMMENT 'Luon la 1 de toi uu SUM()',
@@ -87,6 +115,7 @@ PARTITIONED BY (thoi_gian_id);
 CREATE TABLE IF NOT EXISTS lakehouse.gold.fact_van_hanh_co_quan (
     id                  BIGINT,
     co_quan_id          INT,
+    dim_co_quan_sk      BIGINT,
     so_luong_tiep_nhan  INT COMMENT 'Tong tiep nhan trong ngay',
     so_luong_dung_han   INT COMMENT 'Tong xu ly dung han trong ngay',
     so_luong_tre_han    INT COMMENT 'Tong xu ly tre han trong ngay',
