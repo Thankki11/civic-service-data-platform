@@ -28,7 +28,7 @@ Hai đường cùng dùng các khóa nghiệp vụ `ho_so_id`, `co_quan_id`, `dv
 | Đối tượng | Grain | Nguồn chính | Ý nghĩa |
 |---|---:|---|---|
 | `silver.application` | 1 dòng / hồ sơ | XML + CDC | Hợp nhất hai tập hồ sơ bổ sung trong data mẫu; chọn version mới nhất theo `event_time`. |
-| `silver.application_history` | 1 dòng / hành động | XML + CDC | Nhật ký bất biến, union hai input rồi append chống trùng theo `history_id`. |
+| `silver.application_history` | 1 dòng / hành động | XML + CDC | Nhật ký bất biến, union hai input rồi append chống trùng theo `history_id`; partition Iceberg theo `days(action_time)`. |
 | `gold.fact_ton_dong_ho_so` | 1 dòng / hồ sơ mở / ngày | Silver application + history + dim SCD2 | Snapshot backlog ở 23:59:59, mang surrogate key version của dim. |
 | `gold.fact_van_hanh_co_quan` | 1 dòng / cơ quan / ngày | Các fact/nguồn Silver + dim SCD2 | KPI lãnh đạo và version cơ quan tại ngày chốt. |
 | `gold_realtime.fact_xu_ly_ho_so` | 1 dòng / hành động | StarRocks ODS history + application | Duration từng bước xử lý realtime. |
@@ -184,7 +184,7 @@ File này xây cả Iceberg Gold và StarRocks dimensions trong cùng một lầ
 - `dim_trang_thai`: map id/code/name, có version SCD2 để không đổi nhãn lịch sử nếu danh mục bị sửa.
 - `dim_can_bo`: Officer join Officer_Role/Role, chọn một role đại diện, thêm member `-1`, và lưu SCD2 khi tên/vị trí đổi.
 - `dim_dich_vu_cong`: Service, trong đó `processing_time` trở thành SLA `thoi_han_tra_kq`; đây là SCD2 quan trọng nhất.
-- Iceberg batch dùng SCD2 (`*_sk`, `effective_from_ts`, `effective_to_ts`, `is_current`, `record_hash`). StarRocks giữ Type 1 current-state trong Primary Key table để MV realtime broadcast join nhanh.
+- Iceberg batch dùng SCD2 (`*_sk`, `effective_from_ts`, `effective_to_ts`, `is_current`). Thay đổi được phát hiện bằng so sánh null-safe trực tiếp các tracked column nghiệp vụ; StarRocks giữ Type 1 current-state trong Primary Key table để MV realtime broadcast join nhanh.
 - Vì dimension nhỏ, JDBC ghi theo `coalesce(1)`, batch 1.000 dòng và `rewriteBatchedStatements`.
 
 ### `spark-agg/silver_to_gold.py`

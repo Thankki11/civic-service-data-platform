@@ -11,6 +11,8 @@
 #   Da chay transform/starrocks/ddl_realtime.sql (tao database gold_realtime va cac bang dim/ods/MV ben StarRocks) va da co bang lakehouse.gold.dim_*
 # ============================================================================
 
+from functools import reduce
+
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 
@@ -144,10 +146,6 @@ def save_dim_scd2(df, table_name, business_key, tracked_columns):
             f"silver snapshot {table_name} co business key trung voi noi dung khac: {examples}"
         )
 
-    hash_parts = [
-        F.coalesce(F.col(column).cast("string"), F.lit("<NULL>"))
-        for column in tracked_columns
-    ]
     source = (
         snapshot
         .withColumn("effective_from_ts", F.coalesce(F.col("source_snapshot_at"), F.current_timestamp()))
@@ -158,13 +156,12 @@ def save_dim_scd2(df, table_name, business_key, tracked_columns):
                 F.date_format(F.col("effective_from_ts"), "yyyyMMddHHmmssSSSSSS"),
             ),
         )
-        .withColumn("record_hash", F.sha2(F.concat_ws("\u001f", *hash_parts), 256))
         .withColumn(sk_column, F.xxhash64(F.col(business_key), F.col("source_snapshot_id")))
         .withColumn("effective_to_ts", F.lit(None).cast("timestamp"))
         .withColumn("is_current", F.lit(True))
         .select(
             sk_column, *base_columns, "effective_from_ts", "effective_to_ts",
-            "is_current", "source_snapshot_id", "record_hash",
+            "is_current", "source_snapshot_id",
         )
     )
     output_columns = source.columns
@@ -181,6 +178,12 @@ def save_dim_scd2(df, table_name, business_key, tracked_columns):
         if field.name.lower() not in existing_columns:
             spark.sql(f"ALTER TABLE {full_name} ADD COLUMN `{field.name}` {field.dataType.simpleString()}")
 
+    # `record_hash` thuoc phien ban SCD2 cu. Khong can hash cho cac dim nho:
+    # so sanh null-safe truc tiep cac tracked column se minh bach hon va khong
+    # co rui ro collision. Drop de schema Gold khong con cot chet sau migration.
+    if "record_hash" in existing_columns:
+        spark.sql(f"ALTER TABLE {full_name} DROP COLUMN record_hash")
+
     target = spark.table(full_name)
     # Lan dau chuyen tu Type 1 sang Type 2 khong co moc thay doi lich su. Dat
     # version baseline tu dau calendar demo de fact 2023-2028 join duoc; cac
@@ -196,7 +199,6 @@ def save_dim_scd2(df, table_name, business_key, tracked_columns):
             .withColumn("effective_to_ts", F.col("effective_to_ts").cast("timestamp"))
             .withColumn("is_current", F.coalesce(F.col("is_current"), F.lit(True)))
             .withColumn("source_snapshot_id", F.coalesce(F.col("source_snapshot_id"), F.lit("legacy")))
-            .withColumn("record_hash", F.sha2(F.concat_ws("\u001f", *hash_parts), 256))
             .withColumn(
                 sk_column,
                 F.coalesce(F.col(sk_column), F.xxhash64(F.col(business_key), F.col("source_snapshot_id"))),
@@ -211,23 +213,43 @@ def save_dim_scd2(df, table_name, business_key, tracked_columns):
 
     current = target.filter(F.col("is_current"))
     historical = target.filter(~F.col("is_current"))
-    current_ref = current.select(business_key, F.col("record_hash").alias("_current_hash"))
+
+    # SCD2 change detection phai chi dua tren cac thuoc tinh nghiep vu duoc
+    # khai bao trong tracked_columns. Khong so sanh snapshot/audit metadata vi
+    # chung doi moi lan ingest va se tao version gia. eqNullSafe (<=>) xem
+    # NULL = NULL, dung cho ca string va cac truong SLA nullable.
+    def tracked_values_differ(left_alias, right_alias):
+        comparisons = [
+            ~F.col(f"{left_alias}.`{column}`").eqNullSafe(
+                F.col(f"{right_alias}.`{column}`")
+            )
+            for column in tracked_columns
+        ]
+        return reduce(lambda left, right: left | right, comparisons, F.lit(False))
+
     source_ref = source.select(
         business_key,
-        F.col("record_hash").alias("_source_hash"),
+        *tracked_columns,
         F.col("effective_from_ts").alias("_new_effective_from"),
+    )
+    current_ref = current.select(business_key, *tracked_columns)
+    current_source_condition = (
+        F.col(f"t.`{business_key}`") == F.col(f"s.`{business_key}`")
     )
 
     unchanged = (
         current.alias("t")
-        .join(source_ref.alias("s"), business_key, "inner")
-        .filter(F.col("t.record_hash") == F.col("s._source_hash"))
+        .join(source.alias("s"), current_source_condition, "inner")
+        .filter(~tracked_values_differ("t", "s"))
         .select(*[F.col(f"t.`{column}`").alias(column) for column in output_columns])
     )
     expired = (
         current.alias("t")
-        .join(source_ref.alias("s"), business_key, "left")
-        .filter(F.col("s._source_hash").isNull() | (F.col("t.record_hash") != F.col("s._source_hash")))
+        .join(source_ref.alias("s"), current_source_condition, "left")
+        .filter(
+            F.col(f"s.`{business_key}`").isNull()
+            | tracked_values_differ("t", "s")
+        )
         .select(
             *[F.col(f"t.`{column}`").alias(column) for column in output_columns if column not in {"effective_to_ts", "is_current"}],
             F.coalesce(F.col("s._new_effective_from"), F.current_timestamp()).alias("effective_to_ts"),
@@ -237,8 +259,11 @@ def save_dim_scd2(df, table_name, business_key, tracked_columns):
     )
     new_current = (
         source.alias("s")
-        .join(current_ref.alias("t"), business_key, "left")
-        .filter(F.col("t._current_hash").isNull() | (F.col("s.record_hash") != F.col("t._current_hash")))
+        .join(current_ref.alias("t"), current_source_condition, "left")
+        .filter(
+            F.col(f"t.`{business_key}`").isNull()
+            | tracked_values_differ("s", "t")
+        )
         .select(*[F.col(f"s.`{column}`").alias(column) for column in output_columns])
     )
 

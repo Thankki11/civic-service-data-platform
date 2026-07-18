@@ -26,8 +26,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_co_quan (
     effective_from_ts TIMESTAMP,
     effective_to_ts   TIMESTAMP COMMENT 'Moc ket thuc doc quyen, NULL neu current',
     is_current        BOOLEAN,
-    source_snapshot_id STRING,
-    record_hash       STRING
+    source_snapshot_id STRING
 ) USING iceberg;
 
 CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_trang_thai (
@@ -38,8 +37,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_trang_thai (
     effective_from_ts TIMESTAMP,
     effective_to_ts   TIMESTAMP,
     is_current        BOOLEAN,
-    source_snapshot_id STRING,
-    record_hash       STRING
+    source_snapshot_id STRING
 ) USING iceberg;
 
 CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_can_bo (
@@ -50,8 +48,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_can_bo (
     effective_from_ts TIMESTAMP,
     effective_to_ts   TIMESTAMP,
     is_current        BOOLEAN,
-    source_snapshot_id STRING,
-    record_hash       STRING
+    source_snapshot_id STRING
 ) USING iceberg;
 
 CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_dich_vu_cong (
@@ -62,8 +59,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_dich_vu_cong (
     effective_from_ts TIMESTAMP,
     effective_to_ts   TIMESTAMP,
     is_current        BOOLEAN,
-    source_snapshot_id STRING,
-    record_hash       STRING
+    source_snapshot_id STRING
 ) USING iceberg;
 
 -- ---------------------------------------------------------------------------
