@@ -55,7 +55,7 @@ pipelines:
     latest: "1.0.0"
     versions:
       "1.0.0":
-        code_path: "ingestion/nifi/job4_api_ingestion.py"
+        code_path: "ingestion/nifi/create_table.py"
         packages:
           - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
           - "org.apache.hadoop:hadoop-aws:3.3.4"
@@ -64,6 +64,7 @@ pipelines:
           spark.cores.max: "2"
           spark.executor.cores: "1"
           spark.executor.memory: "1g"
+
 
   silver:
     description: "Bronze -> Silver (dedup, chuan hoa)"

@@ -244,10 +244,17 @@ services:
   # ---------- CI/CD (Layer 7) — Thành ----------
   jenkins:
     image: jenkins/jenkins:lts
+    user: root                         # Cần root để gọi Docker socket của host
     ports:
       - "8090:8080"
+      - "50000:50000"                  # JNLP agent port (nếu dùng distributed build)
+    environment:
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
     volumes:
       - jenkins-data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock   # Cho phép Jenkins gọi Docker host
+      - .:/workspace:ro                              # Mount repo để copy files
+
 
   # ---------- MOCK DATA GENERATORS ----------
   mock-api:

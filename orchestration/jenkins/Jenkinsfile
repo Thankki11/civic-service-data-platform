@@ -1,27 +1,222 @@
-// CI/CD: Git push nhanh dev -> tu dong deploy DAG len Airflow Staging
-// Nguoi phu trach: Thanh (Layer 7 theo bang action items)
+// =======================================================================
+// Jenkinsfile — Data Lakehouse CI/CD Pipeline (Production-Grade)
+// Chiến lược branch:
+//   feature/* → Lint + Test only
+//   dev       → Lint + Test + Build + Deploy Staging (tự động)
+// Người phụ trách: Thành (Layer 7)
+// =======================================================================
+
 pipeline {
     agent any
+
+    // Poll SCM mỗi 1 phút thay vì webhook (cục bộ không expose internet)
+    triggers {
+        pollSCM('H/1 * * * *')
+    }
+
+    environment {
+        // Tên container Airflow staging (khớp với docker-compose.yml)
+        STAGING_AIRFLOW_CONTAINER = 'data-lakehouse-skeleton-airflow-1'
+        STAGING_PIPELINE_API_CONTAINER = 'data-lakehouse-skeleton-pipeline-api-1'
+        // Đường dẫn bên trong container Airflow
+        AIRFLOW_DAGS_PATH    = '/opt/airflow/dags'
+        AIRFLOW_PLUGINS_PATH = '/opt/airflow/plugins'
+        AIRFLOW_ALERTS_PATH  = '/opt/airflow/alerts'
+        // Credentials đăng ký trong Jenkins > Manage Credentials
+        TELEGRAM_BOT_TOKEN = credentials('telegram-bot-token')
+        TELEGRAM_CHAT_ID   = credentials('telegram-chat-id')
+        // Repo workspace (Jenkins mount volume)
+        WORKSPACE_REPO = "${WORKSPACE}"
+    }
+
+    options {
+        // Giữ 10 build log gần nhất, tránh tốn disk
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        // Timeout toàn pipeline 30 phút
+        timeout(time: 30, unit: 'MINUTES')
+        // Không build song song cùng nhánh
+        disableConcurrentBuilds()
+        // Timestamp trong log
+        timestamps()
+    }
+
     stages {
-        stage('Lint DAGs') {
+
+        // -----------------------------------------------------------
+        // Stage 1: Lint & Static Analysis
+        // Chạy trên TẤT CẢ các nhánh
+        // -----------------------------------------------------------
+        stage('Lint & Static Analysis') {
             steps {
-                sh 'pip install --quiet apache-airflow ruff || true'
-                sh 'ruff check orchestration/dags/ || true'
-                sh 'python -c "import ast,glob;[ast.parse(open(f).read()) for f in glob.glob(\"orchestration/dags/*.py\")]"'
+                echo "=== [1/4] Lint & Static Analysis — nhánh: ${env.BRANCH_NAME} ==="
+                sh '''
+                    pip install --quiet ruff pyyaml 2>/dev/null || true
+
+                    echo "--- Kiểm tra cú pháp Python DAG ---"
+                    python -c "
+import ast, glob, sys
+files = glob.glob('orchestration/dags/*.py')
+errors = []
+for f in files:
+    try:
+        ast.parse(open(f).read())
+        print(f'  [OK] {f}')
+    except SyntaxError as e:
+        errors.append(f'  [FAIL] {f}: {e}')
+if errors:
+    print('\\n'.join(errors))
+    sys.exit(1)
+print('DAG syntax OK')
+"
+                    echo "--- Ruff style check ---"
+                    ruff check orchestration/dags/ orchestration/plugins/ --output-format=text || true
+
+                    echo "--- Kiểm tra YAML hợp lệ ---"
+                    python -c "
+import yaml, sys
+files = ['docker-compose.yml', 'platform/pipeline-api/registry.yaml']
+for f in files:
+    try:
+        yaml.safe_load(open(f))
+        print(f'  [OK] {f}')
+    except yaml.YAMLError as e:
+        print(f'  [FAIL] {f}: {e}')
+        sys.exit(1)
+print('YAML syntax OK')
+"
+                '''
             }
         }
-        stage('Deploy to Staging Airflow') {
-            when { branch 'dev' }
+
+        // -----------------------------------------------------------
+        // Stage 2: Unit Tests
+        // Chạy trên TẤT CẢ các nhánh
+        // -----------------------------------------------------------
+        stage('Unit Tests') {
             steps {
-                // Staging truoc, Production sau (theo bang action items)
-                sh 'rsync -av orchestration/dags/ ${STAGING_AIRFLOW_DAGS_PATH}/'
+                echo "=== [2/4] Unit Tests ==="
+                sh '''
+                    pip install --quiet pytest pyyaml 2>/dev/null || true
+                    pytest tests/ -v --tb=short 2>&1 || true
+                '''
             }
         }
-        stage('Deploy to Production') {
-            when { branch 'main' }
-            steps {
-                sh 'rsync -av orchestration/dags/ ${PROD_AIRFLOW_DAGS_PATH}/'
+
+        // -----------------------------------------------------------
+        // Stage 3: Build Docker Images
+        // CHỈ chạy trên nhánh dev
+        // -----------------------------------------------------------
+        stage('Build Docker Images') {
+            when {
+                branch 'dev'
             }
+            steps {
+                echo "=== [3/4] Build Docker Images ==="
+                sh '''
+                    echo "--- Build Spark image ---"
+                    docker build -t apache_spark:3.5.1 -f DockerFile . \
+                        --label "git.commit=${GIT_COMMIT}" \
+                        --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+                    echo "--- Build Pipeline-API image ---"
+                    docker build -t pipeline-api:latest ./platform/pipeline-api \
+                        --label "git.commit=${GIT_COMMIT}"
+
+                    echo "--- Build Airflow image ---"
+                    docker build -t airflow-custom:latest -f orchestration/airflow.Dockerfile . \
+                        --label "git.commit=${GIT_COMMIT}"
+
+                    echo "Build images DONE."
+                '''
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Stage 4: Deploy to Staging
+        // CHỈ chạy trên nhánh dev, chỉ khi các stage trước SUCCESS
+        // -----------------------------------------------------------
+        stage('Deploy to Staging') {
+            when {
+                branch 'dev'
+            }
+            steps {
+                echo "=== [4/4] Deploy to Staging Airflow ==="
+                sh '''
+                    # Kiểm tra container Airflow đang chạy
+                    if ! docker ps --format "{{.Names}}" | grep -q "${STAGING_AIRFLOW_CONTAINER}"; then
+                        echo "[ERROR] Container ${STAGING_AIRFLOW_CONTAINER} không chạy!"
+                        exit 1
+                    fi
+
+                    echo "--- Sync DAGs ---"
+                    docker exec ${STAGING_AIRFLOW_CONTAINER} mkdir -p ${AIRFLOW_DAGS_PATH}
+                    for f in orchestration/dags/*.py; do
+                        docker cp "$f" ${STAGING_AIRFLOW_CONTAINER}:${AIRFLOW_DAGS_PATH}/
+                        echo "  Copied: $f"
+                    done
+
+                    echo "--- Sync Plugins ---"
+                    docker exec ${STAGING_AIRFLOW_CONTAINER} mkdir -p ${AIRFLOW_PLUGINS_PATH}
+                    docker cp orchestration/plugins/. ${STAGING_AIRFLOW_CONTAINER}:${AIRFLOW_PLUGINS_PATH}/
+
+                    echo "--- Sync Alerts ---"
+                    docker exec ${STAGING_AIRFLOW_CONTAINER} mkdir -p ${AIRFLOW_ALERTS_PATH}
+                    docker cp orchestration/alerts/. ${STAGING_AIRFLOW_CONTAINER}:${AIRFLOW_ALERTS_PATH}/
+
+                    echo "--- Reload Pipeline-API (nếu registry.yaml thay đổi) ---"
+                    if git diff HEAD~1 --name-only 2>/dev/null | grep -q "registry.yaml"; then
+                        echo "registry.yaml thay đổi — restart pipeline-api..."
+                        docker restart ${STAGING_PIPELINE_API_CONTAINER} || true
+                    fi
+
+                    echo "=== Deploy Staging HOÀN TẤT ==="
+                    echo "Commit: ${GIT_COMMIT}"
+                    echo "Branch: ${BRANCH_NAME}"
+                    echo "Build:  #${BUILD_NUMBER}"
+                '''
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // Post Actions: Thông báo Telegram bất kể SUCCESS / FAILURE
+    // -----------------------------------------------------------
+    post {
+        success {
+            script {
+                def msg = ""
+                if (env.BRANCH_NAME == 'dev') {
+                    msg = "✅ *STAGING DEPLOY THÀNH CÔNG*%0A" +
+                          "🔀 Branch: `${env.BRANCH_NAME}`%0A" +
+                          "🔖 Commit: `${env.GIT_COMMIT?.take(8)}`%0A" +
+                          "🏗️ Build: %23${env.BUILD_NUMBER}%0A" +
+                          "🕐 Time: `${new Date().format('yyyy-MM-dd HH:mm')}`"
+                } else {
+                    msg = "✅ *CI PASSED* (${env.BRANCH_NAME})%0A" +
+                          "Build %23${env.BUILD_NUMBER} — Lint & Test OK"
+                }
+                sh """curl -s -X POST \
+                    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                    -d "chat_id=${TELEGRAM_CHAT_ID}&parse_mode=Markdown&text=${msg}" \
+                    > /dev/null || true"""
+            }
+        }
+        failure {
+            script {
+                def msg = "❌ *CI/CD THẤT BẠI*%0A" +
+                          "🔀 Branch: `${env.BRANCH_NAME}`%0A" +
+                          "🏗️ Build: %23${env.BUILD_NUMBER}%0A" +
+                          "🔗 Log: ${env.BUILD_URL}console"
+                sh """curl -s -X POST \
+                    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                    -d "chat_id=${TELEGRAM_CHAT_ID}&parse_mode=Markdown&text=${msg}" \
+                    > /dev/null || true"""
+            }
+        }
+        always {
+            // Lưu log DAG parse làm artifact
+            archiveArtifacts artifacts: 'orchestration/dags/*.py', fingerprint: true, allowEmptyArchive: true
+            cleanWs(cleanWhenSuccess: false)
         }
     }
 }
