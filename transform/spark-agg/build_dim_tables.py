@@ -93,33 +93,40 @@ def save_dim(df, table_name, key_cols):
     # Dimension chi co it dong. Gom mot partition va ghi theo batch de tranh
     # hang tram JDBC connection/commit nho vao StarRocks (dac biet dim_time).
     # Primary Key model van upsert idempotent khi job duoc chay lai.
-    (
-        df.coalesce(1).write.format("jdbc")
-        .option("url", STARROCKS_JDBC_URL)
-        .option("dbtable", table_name)
-        .option("user", STARROCKS_USER)
-        .option("password", STARROCKS_PASSWORD)
-        .option("driver", "com.mysql.cj.jdbc.Driver")
-        .option("batchsize", "1000")
-        .mode("append")   # bang dim ben StarRocks la PRIMARY KEY -> INSERT trung khoa se tu UPSERT
-        .save()
-    )
-    print(f"[+] dim.{table_name} <- da ghi vao Iceberg (gold.{table_name}) va StarRocks (gold_realtime.{table_name})")
+    try:
+        (
+            df.coalesce(1).write.format("jdbc")
+            .option("url", STARROCKS_JDBC_URL)
+            .option("dbtable", table_name)
+            .option("user", STARROCKS_USER)
+            .option("password", STARROCKS_PASSWORD)
+            .option("driver", "com.mysql.cj.jdbc.Driver")
+            .option("batchsize", "1000")
+            .mode("append")   # bang dim ben StarRocks la PRIMARY KEY -> INSERT trung khoa se tu UPSERT
+            .save()
+        )
+        print(f"[+] dim.{table_name} <- da ghi vao Iceberg (gold.{table_name}) va StarRocks (gold_realtime.{table_name})")
+    except Exception as e:
+        print(f"[!] dim.{table_name} <- da ghi vao Iceberg (gold.{table_name}), nhung StarRocks JDBC bo qua: {e}")
 
 
 def write_current_dim_to_starrocks(df, table_name):
     """StarRocks realtime chi can Type 1/current-state de MV join nhanh."""
-    (
-        df.coalesce(1).write.format("jdbc")
-        .option("url", STARROCKS_JDBC_URL)
-        .option("dbtable", table_name)
-        .option("user", STARROCKS_USER)
-        .option("password", STARROCKS_PASSWORD)
-        .option("driver", "com.mysql.cj.jdbc.Driver")
-        .option("batchsize", "1000")
-        .mode("append")
-        .save()
-    )
+    try:
+        (
+            df.coalesce(1).write.format("jdbc")
+            .option("url", STARROCKS_JDBC_URL)
+            .option("dbtable", table_name)
+            .option("user", STARROCKS_USER)
+            .option("password", STARROCKS_PASSWORD)
+            .option("driver", "com.mysql.cj.jdbc.Driver")
+            .option("batchsize", "1000")
+            .mode("append")
+            .save()
+        )
+    except Exception as e:
+        print(f"[!] StarRocks current dim {table_name} JDBC write skipped: {e}")
+
 
 
 def save_dim_scd2(df, table_name, business_key, tracked_columns):
