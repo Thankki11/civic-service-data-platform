@@ -50,10 +50,10 @@ pipeline {
             steps {
                 echo "=== [1/4] Lint & Static Analysis — nhánh: ${env.BRANCH_NAME} ==="
                 sh '''
-                    pip install --quiet ruff pyyaml 2>/dev/null || true
+                    python3 -m pip install --quiet ruff pyyaml 2>/dev/null || true
 
                     echo "--- Kiểm tra cú pháp Python DAG ---"
-                    python -c "
+                    python3 -c "
 import ast, glob, sys
 files = glob.glob('orchestration/dags/*.py')
 errors = []
@@ -72,7 +72,7 @@ print('DAG syntax OK')
                     ruff check orchestration/dags/ orchestration/plugins/ --output-format=text || true
 
                     echo "--- Kiểm tra YAML hợp lệ ---"
-                    python -c "
+                    python3 -c "
 import yaml, sys
 files = ['docker-compose.yml', 'platform/pipeline-api/registry.yaml']
 for f in files:
@@ -96,7 +96,7 @@ print('YAML syntax OK')
             steps {
                 echo "=== [2/4] Unit Tests ==="
                 sh '''
-                    pip install --quiet pytest pyyaml 2>/dev/null || true
+                    python3 -m pip install --quiet pytest pyyaml 2>/dev/null || true
                     pytest tests/ -v --tb=short 2>&1 || true
                 '''
             }
@@ -188,23 +188,22 @@ print('YAML syntax OK')
                 def branchName = env.BRANCH_NAME ?: 'unknown'
                 def buildNum   = env.BUILD_NUMBER ?: '?'
                 def commitHash = (env.GIT_COMMIT ?: 'unknown').take(8)
-                def buildUrl   = env.BUILD_URL ?: 'http://localhost:8090/'
                 def msg
                 if (branchName == 'dev') {
-                    msg = "\u2705 *STAGING DEPLOY TH\u00c0NH C\u00d4NG*%0A" +
-                          "\uD83D\uDD00 Branch: `${branchName}`%0A" +
-                          "\uD83D\uDD16 Commit: `${commitHash}`%0A" +
-                          "\uD83C\uDFD7\uFE0F Build: %23${buildNum}%0A" +
-                          "\uD83D\uDD50 Time: `${new Date().format('yyyy-MM-dd HH:mm')}`"
+                    msg = "✅ *STAGING DEPLOY THÀNH CÔNG*\n" +
+                          "🔀 Branch: `${branchName}`\n" +
+                          "🔖 Commit: `${commitHash}`\n" +
+                          "🏗️ Build: #${buildNum}\n" +
+                          "🕐 Time: `${new Date().format('yyyy-MM-dd HH:mm')}`"
                 } else {
-                    msg = "\u2705 *CI PASSED* (${branchName})%0A" +
-                          "Build %23${buildNum} \u2014 Lint & Test OK"
+                    msg = "✅ *CI PASSED* (${branchName})\n" +
+                          "Build #${buildNum} — Lint & Test OK"
                 }
                 withCredentials([
                     string(credentialsId: 'telegram-bot-token', variable: 'TG_TOKEN'),
                     string(credentialsId: 'telegram-chat-id',   variable: 'TG_CHAT')
                 ]) {
-                    sh "curl -s -X POST 'https://api.telegram.org/bot${TG_TOKEN}/sendMessage' --data-urlencode 'chat_id=${TG_CHAT}' --data-urlencode 'parse_mode=Markdown' --data-urlencode 'text=${msg}' > /dev/null || true"
+                    sh "curl -s -X POST \"https://api.telegram.org/bot${TG_TOKEN}/sendMessage\" --data-urlencode \"chat_id=${TG_CHAT}\" --data-urlencode \"parse_mode=Markdown\" --data-urlencode \"text=${msg}\" > /dev/null || true"
                 }
             }
         }
@@ -213,15 +212,15 @@ print('YAML syntax OK')
                 def branchName = env.BRANCH_NAME ?: 'unknown'
                 def buildNum   = env.BUILD_NUMBER ?: '?'
                 def buildUrl   = env.BUILD_URL ?: 'http://localhost:8090/'
-                def msg = "\u274C *CI/CD TH\u1EA4T B\u1EA1I*%0A" +
-                          "\uD83D\uDD00 Branch: `${branchName}`%0A" +
-                          "\uD83C\uDFD7\uFE0F Build: %23${buildNum}%0A" +
-                          "\uD83D\uDD17 Log: ${buildUrl}console"
+                def msg = "❌ *CI/CD THẤT BẠI*\n" +
+                          "🔀 Branch: `${branchName}`\n" +
+                          "🏗️ Build: #${buildNum}\n" +
+                          "🔗 Log: ${buildUrl}console"
                 withCredentials([
                     string(credentialsId: 'telegram-bot-token', variable: 'TG_TOKEN'),
                     string(credentialsId: 'telegram-chat-id',   variable: 'TG_CHAT')
                 ]) {
-                    sh "curl -s -X POST 'https://api.telegram.org/bot${TG_TOKEN}/sendMessage' --data-urlencode 'chat_id=${TG_CHAT}' --data-urlencode 'parse_mode=Markdown' --data-urlencode 'text=${msg}' > /dev/null || true"
+                    sh "curl -s -X POST \"https://api.telegram.org/bot${TG_TOKEN}/sendMessage\" --data-urlencode \"chat_id=${TG_CHAT}\" --data-urlencode \"parse_mode=Markdown\" --data-urlencode \"text=${msg}\" > /dev/null || true"
                 }
             }
         }
