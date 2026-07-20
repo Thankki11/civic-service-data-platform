@@ -25,7 +25,6 @@ _EXPIRY_SKEW = 30
 
 class KeycloakHook(BaseHook):
     """Hook toi Keycloak, cache token trong pham vi 1 instance."""
-
     def __init__(self, conn_id: str = DEFAULT_CONN_ID) -> None:
         super().__init__()
         self.conn_id = conn_id

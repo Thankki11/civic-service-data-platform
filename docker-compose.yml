@@ -13,15 +13,15 @@ services:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Console
+      - "9000:9000" # S3 API
+      - "9001:9001" # Console
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - minio-data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: [ "CMD", "mc", "ready", "local" ]
       interval: 10s
       retries: 5
 
@@ -32,16 +32,11 @@ services:
       minio:
         condition: service_healthy
     entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
-      mc mb -p local/landing-zone local/bronze local/silver local/gold local/lakehouse local/quarantine-zone &&
-      (mc admin user add local minio_access_key minio_secret_key || true) &&
-      (mc admin policy attach local readwrite --user minio_access_key || true) &&
-      exit 0"
+      /bin/sh -c " mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} && mc mb -p local/landing-zone local/bronze local/silver local/gold local/lakehouse local/quarantine-zone && (mc admin user add local minio_access_key minio_secret_key || true) && (mc admin policy attach local readwrite --user minio_access_key || true) && exit 0"
 
   # ---------- BUFFER / CDC (Layer 2) — Kiên ----------
   kafka:
-    image: apache/kafka:3.8.0        # KRaft mode, không cần Zookeeper
+    image: apache/kafka:3.8.0 # KRaft mode, không cần Zookeeper
     ports:
       - "9092:9092"
     environment:
@@ -57,7 +52,7 @@ services:
     container_name: source_db
     image: postgres:11
     hostname: source_db
-    command: ["postgres", "-c", "wal_level=logical"]
+    command: [ "postgres", "-c", "wal_level=logical" ]
     ports:
       - '5433:5432'
     environment:
@@ -91,7 +86,7 @@ services:
     environment:
       SINGLE_USER_CREDENTIALS_USERNAME: ${NIFI_USER}
       SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_PASSWORD}
-      NIFI_JVM_HEAP_INIT: 1g          # Kiên tuning heap size tại đây
+      NIFI_JVM_HEAP_INIT: 1g # Kiên tuning heap size tại đây
       NIFI_JVM_HEAP_MAX: 2g
       # Cho phép host header từ service DNS (Airflow gọi https://nifi:8443)
       NIFI_WEB_PROXY_HOST: "nifi:8443,nifi,localhost:8443,localhost"
@@ -106,7 +101,7 @@ services:
     image: apache_spark:3.5.1
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     ports:
-      - "8081:8080"   # Spark Master UI
+      - "8081:8080" # Spark Master UI
       - "7077:7077"
     environment:
       SPARK_NO_DAEMONIZE: "true"
@@ -114,15 +109,15 @@ services:
       - .:/opt/spark-data
       - ./ingestion/spark-batch:/opt/jobs/ingestion
       - ./transform:/opt/jobs/transform
-      - ./jars:/opt/spark/extra-jars   # iceberg-spark-runtime, hadoop-aws, aws-sdk
+      - ./jars:/opt/spark/extra-jars # iceberg-spark-runtime, hadoop-aws, aws-sdk
 
   spark-worker:
     image: apache_spark:3.5.1
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
-    depends_on: [spark-master]
+    depends_on: [ spark-master ]
     environment:
       SPARK_NO_DAEMONIZE: "true"
-      SPARK_WORKER_MEMORY: 2g          # executor memory tối thiểu ~471MB, để 2g cho an toàn
+      SPARK_WORKER_MEMORY: 2g # executor memory tối thiểu ~471MB, để 2g cho an toàn
       SPARK_WORKER_CORES: 2
     volumes:
       - .:/opt/spark-data
@@ -142,41 +137,38 @@ services:
 
   hive-metastore:
     image: apache/hive:4.0.0
-    depends_on: [metastore-db, minio]
+    depends_on: [ metastore-db, minio ]
     ports:
       - "9083:9083"
     environment:
       SERVICE_NAME: metastore
       DB_DRIVER: postgres
       SERVICE_OPTS: >-
-        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
-        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://metastore-db:5432/metastore
-        -Djavax.jdo.option.ConnectionUserName=hive
-        -Djavax.jdo.option.ConnectionPassword=${METASTORE_DB_PASSWORD}
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://metastore-db:5432/metastore -Djavax.jdo.option.ConnectionUserName=hive -Djavax.jdo.option.ConnectionPassword=${METASTORE_DB_PASSWORD}
 
   # ---------- REAL-TIME OLAP (Layer 4) — Quân ----------
   starrocks:
     image: starrocks/allin1-ubuntu:3.3-latest
     ports:
-      - "8030:8030"   # FE HTTP
-      - "9030:9030"   # FE MySQL protocol
-      - "8040:8040"   # BE
+      - "8030:8030" # FE HTTP
+      - "9030:9030" # FE MySQL protocol
+      - "8040:8040" # BE
     # Routine Load config: transform/starrocks/routine_load.sql
 
-  # ---------- QUERY ENGINE (Layer 4) — Trung ----------
+    # ---------- QUERY ENGINE (Layer 4) — Trung ----------
   trino:
     image: trinodb/trino:453
-    depends_on: [hive-metastore, minio]
+    depends_on: [ hive-metastore, minio ]
     ports:
       - "8082:8080"
     volumes:
       - ./transform/metastore/trino-catalog:/etc/trino/catalog
       # catalog iceberg.properties trỏ tới hive-metastore:9083 + MinIO
 
-  # ---------- PRESENTATION (Layer 5) — Trung ----------
+      # ---------- PRESENTATION (Layer 5) — Trung ----------
   superset:
     image: apache/superset:4.0.2
-    depends_on: [trino, starrocks]
+    depends_on: [ trino, starrocks ]
     ports:
       - "8088:8088"
     environment:
@@ -184,7 +176,7 @@ services:
     # Sau khi up: superset db upgrade && superset init
     # Data connection: trino://... và starrocks (mysql protocol :9030)
 
-  # ---------- ORCHESTRATION (Layer 6) — Thành ----------
+    # ---------- ORCHESTRATION (Layer 6) — Thành ----------
   airflow-db:
     image: postgres:16
     environment:
@@ -198,13 +190,17 @@ services:
     build:
       context: .
       dockerfile: orchestration/airflow.Dockerfile
-    depends_on: [airflow-db]
+    depends_on: [ airflow-db ]
     ports:
       - "8080:8080"
     environment:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@airflow-db/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Webserver: cho gunicorn nhiều thời gian boot (import DAG nặng pyspark) + ít worker
+      AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "600"
+      AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: "300"
+      AIRFLOW__WEBSERVER__WORKERS: "2"
       # Connections (khai báo qua env, không cần tạo tay trên UI). BẪY #1: host spark://
       AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type":"spark","host":"spark://spark-master","port":7077}'
       AIRFLOW_CONN_KEYCLOAK_DEFAULT: '{"conn_type":"http","host":"http://keycloak:8080","login":"${KEYCLOAK_ROPC_USER}","password":"${KEYCLOAK_ROPC_PASSWORD}","extra":{"realm":"lakehouse","client_id":"${KEYCLOAK_CLIENT_ID}","client_secret":"${KEYCLOAK_CLIENT_SECRET}"}}'
@@ -222,17 +218,16 @@ services:
       - ./orchestration/dags:/opt/airflow/dags
       - ./orchestration/plugins:/opt/airflow/plugins
       - ./orchestration/alerts:/opt/airflow/alerts
-      - .:/opt/airflow/repo          # cho seed_and_sync_xml chạy script data-generator
+      - .:/opt/airflow/repo # cho seed_and_sync_xml chạy script data-generator
     command: standalone
 
   # ---------- CONTROL-PLANE (Layer 6) — Thành ----------
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
-    command: ["start-dev", "--import-realm"]
+    command: [ "start-dev", "--import-realm" ]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
-      # Truyền để realm file thay ${...} lúc import (realm giữ nguồn từ .env)
       KEYCLOAK_ROPC_USER: ${KEYCLOAK_ROPC_USER}
       KEYCLOAK_ROPC_PASSWORD: ${KEYCLOAK_ROPC_PASSWORD}
       KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID}
@@ -245,17 +240,17 @@ services:
   pipeline-api:
     build:
       context: ./platform/pipeline-api
-    depends_on: [keycloak]
+    depends_on: [ keycloak ]
     environment:
       KEYCLOAK_ISSUER: http://keycloak:8080/realms/lakehouse
       WORKSPACE_ROOT: /workspace
-      REGISTRY_PATH: /workspace/platform/pipeline-api/registry.yaml   # đọc registry live (không cần rebuild)
+      REGISTRY_PATH: /workspace/platform/pipeline-api/registry.yaml # đọc registry live (không cần rebuild)
       MINIO_ROOT_USER: minio_access_key
       MINIO_ROOT_PASSWORD: minio_secret_key
     ports:
       - "8000:8000"
     volumes:
-      - .:/workspace:ro     # đọc code job thật của Kiên (versioned qua registry)
+      - .:/workspace:ro # đọc code job thật của Kiên (versioned qua registry)
 
   # ---------- CI/CD (Layer 7) — Thành ----------
   jenkins:
@@ -266,7 +261,7 @@ services:
       - jenkins-data:/var/jenkins_home
     # Pipeline: orchestration/jenkins/Jenkinsfile
 
-  # ---------- MOCK DATA GENERATORS (Ingestion Branch) ----------
+    # ---------- MOCK DATA GENERATORS (Ingestion Branch) ----------
   mock-api:
     build:
       context: .
@@ -274,7 +269,7 @@ services:
     container_name: mock-api
     ports:
       - "5000:5000"
-    command: ["python", "mock_api_server.py"]
+    command: [ "python", "mock_api_server.py" ]
     volumes:
       - ./data-generator:/app
 
@@ -283,7 +278,7 @@ services:
       context: .
       dockerfile: Dockerfile.python
     container_name: stream-simulator
-    command: ["python", "data_stream_simulator.py"]
+    command: [ "python", "data_stream_simulator.py" ]
     volumes:
       - ./data-generator:/app
     environment:

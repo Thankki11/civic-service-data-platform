@@ -65,7 +65,7 @@ def notify_failure(context):
         "❌ AIRFLOW TASK FAILED\n"
         f"DAG: {ti.dag_id}\n"
         f"Task: {ti.task_id}\n"
-        f"Lan thu: {ti.try_number - 1}/{ti.max_tries + 1}\n"
+        f"Lan thu: {ti.try_number - 1}/{ti.max_tries}\n"
         f"Thoi diem: {context.get('ts')}\n"
         f"Log: {ti.log_url}"
     )
