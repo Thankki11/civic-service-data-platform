@@ -1,10 +1,34 @@
+-- ============================================================================
+-- File: transform/starrocks/routine_load.sql
+-- Phu trach: Quan (DE)
+-- Muc dich: 2 Routine Load doc TRUC TIEP tu Kafka (khong qua Flink) de nap
+--           du lieu CDC realtime vao 2 bang ODS dinh nghia trong
+--           ddl_realtime.sql. Bang fact_xu_ly_ho_so KHONG duoc Routine Load
+--           nao nap truc tiep - no la Materialized View tu dong REFRESH tu
+--           2 bang ODS nay (xem ddl_realtime.sql).
+--
 -- Cach chay (1 lan, thu cong, SAU KHI da chay ddl_realtime.sql):
 --   mysql -h 127.0.0.1 -P 9030 -u root < routine_load.sql
+--
+-- LUU Y VE TEN TOPIC KAFKA
+--   So do kien truc tong quan (Layer 2) ve 1 hop "Kafka Topic [db_cdc_events]"
+--   mang tinh KHAI NIEM (1 luong CDC chung). Tren thuc te, Debezium
+--   (ingestion/debezium_config.json, topic.prefix=postgres_server) sinh ra
+--   MOI BANG 1 topic RIENG dang <prefix>.<schema>.<table>. O day dung DUNG
+--   ten topic thuc te de Routine Load chay duoc:
+--     - postgres_server.public.Application
+--     - postgres_server.public.Application_History
+-- ============================================================================
 
 USE gold_realtime;
 
---    Debezium DELETE dat payload.after = null, nen khoa phai lay COALESCE tu after.id/before.id. Connector da tat tombstone de Routine Load khong gap ban tin value = null sau DELETE.
-
+-- ----------------------------------------------------------------------------
+-- 1. Routine Load: Application -> ods_application_rt (Primary Key, upsert)
+--    Ho tro INSERT/UPDATE/snapshot (op=c/u/r -> upsert) va DELETE (op=d).
+--    Debezium DELETE dat payload.after = null, nen khoa phai lay COALESCE tu
+--    after.id/before.id. Connector da tat tombstone de Routine Load khong gap
+--    ban tin value = null sau DELETE.
+-- ----------------------------------------------------------------------------
 CREATE ROUTINE LOAD gold_realtime.rl_application ON ods_application_rt
 COLUMNS (
     after_ho_so_id, before_ho_so_id,
@@ -38,12 +62,17 @@ FROM KAFKA (
     "property.group.id" = "starrocks_rt_application"
 );
 
+
+-- ----------------------------------------------------------------------------
 -- 2. Routine Load: Application_History -> ods_application_history_rt
 --    (Duplicate Key, append-only)
+--    Day la NGUON DUY NHAT de tinh fact_xu_ly_ho_so - xem giai thich chi
+--    tiet trong phan tra loi cau hoi "doc CDC before/after Application hay
+--    Application_History" gui kem trong tin nhan.
 --    Bang nay la INSERT-ONLY trong nghiep vu: chi chap nhan INSERT CDC (c)
 --    va snapshot ban dau (r). StarRocks 4.1 chi cho WHERE tham chieu cot dich,
 --    nen cdc_op la cot ky thuat trong ODS de loc c/r truoc khi ghi fact.
-
+-- ----------------------------------------------------------------------------
 CREATE ROUTINE LOAD gold_realtime.rl_application_history ON ods_application_history_rt
 COLUMNS (
     id, ho_so_id, trang_thai_truoc_id, trang_thai_id, can_bo_id,
@@ -69,10 +98,10 @@ FROM KAFKA (
 );
 
 
-
--- 3. Cau lenh giam sat (chay dinh ky thu cong, hoac tich hop vao alert trong orchestration/alerts/notify.py)
-
-
+-- ----------------------------------------------------------------------------
+-- 3. Cau lenh giam sat (chay dinh ky thu cong, hoac tich hop vao alert cua
+--    Thanh trong orchestration/alerts/notify.py)
+-- ----------------------------------------------------------------------------
 -- SHOW ROUTINE LOAD FOR gold_realtime.rl_application \G
 -- SHOW ROUTINE LOAD FOR gold_realtime.rl_application_history \G
 -- -- Chu y cot "State": neu = PAUSED/CANCELLED nghia la job da NGUNG NHAN

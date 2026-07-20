@@ -160,7 +160,33 @@ def worker_fire_batch(batch_size):
                     known_ids.append(app_id)
                 else:
                     app_id = random.choice(known_ids)
-                    new_status = random.randint(2, 7)
+                    # Application_History la audit log chuyen trang thai. Lay
+                    # dung trang thai hien tai tu OLTP truoc khi update thay vi
+                    # ghi co dinh Statusid = 1 (RECEIVED) cho moi event.
+                    cursor.execute(
+                        'SELECT "Statusid" FROM "Application" WHERE id = %s',
+                        (app_id,),
+                    )
+                    current_status_row = cursor.fetchone()
+                    if current_status_row is None:
+                        continue
+
+                    previous_status = current_status_row[0]
+                    # Luong nghiep vu hop le: RECEIVED -> ASSIGNED ->
+                    # PROCESSING -> PENDING_APPROVAL -> APPROVED -> READY ->
+                    # COMPLETED; REJECTED va COMPLETED la trang thai ket thuc.
+                    next_statuses = {
+                        1: [2],
+                        2: [3],
+                        3: [4, 8],
+                        4: [5],
+                        5: [6],
+                        6: [7],
+                    }
+                    candidate_statuses = next_statuses.get(previous_status, [])
+                    if not candidate_statuses:
+                        continue
+                    new_status = random.choice(candidate_statuses)
                     
                     cursor.execute("""
                         UPDATE "Application"
@@ -173,7 +199,7 @@ def worker_fire_batch(batch_size):
                     cursor.execute("""
                         INSERT INTO "Application_History" (id, "Applicationid", "Statusid", "Statusid2", "Officerid", action_time)
                         VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                    """, (hist_id, app_id, 1, new_status, officer_id))
+                    """, (hist_id, app_id, previous_status, new_status, officer_id))
 
                 # ========================================================
                 # 2. BẮN ĐẠN CHO APPLICANT (Người nộp) - SCD/Streaming
@@ -216,7 +242,7 @@ def worker_fire_batch(batch_size):
             conn.close()
 
 def simulate_auto_stream(speed_per_second):
-    logging.info(f"🚀 BẮT ĐẦU AUTO CDC STREAMING (IN-MEMORY) - Tốc độ: {speed_per_second} req/s")
+    logging.info(f" BẮT ĐẦU AUTO CDC STREAMING - Tốc độ: {speed_per_second} req/s")
     
     batch_size = speed_per_second
     
@@ -230,6 +256,7 @@ def simulate_auto_stream(speed_per_second):
             logging.info(f"[*] Da tu sinh va na {batch_size} goi XML vao PostgreSQL")
             
             # Cân bằng tốc độ để đạt đúng req/s
+            time.sleep(random.randint(5, 30))
             elapsed = time.time() - start_time
             sleep_time = 1.0 - elapsed
             if sleep_time > 0:
@@ -240,12 +267,9 @@ if __name__ == "__main__":
     print(" IN-MEMORY AUTO CDC STREAMING SIMULATOR ")
     print("="*60)
     fetch_initial_ids()
-    try:
-        speed = int(input("Nhập tốc độ bắn (số sự kiện / giây) [Mặc định: 50]: ") or "50")
-    except (ValueError, EOFError):
-        speed = 50
+    speed = 1
         
     try:
         simulate_auto_stream(speed)
     except KeyboardInterrupt:
-        print("\n⏹️ Đã dừng chiến dịch Stress Test.")
+        print("\n Stop")

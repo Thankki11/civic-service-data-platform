@@ -1,9 +1,12 @@
 # Smoke test end-to-end (chạy chung ngày T6)
 
-1. `python data-generator/generate_xml.py` → file XML có trong `landing-zone`
+1. `docker compose run --rm data-transactional-gen`, đồng bộ XML bằng
+   `ingestion/sync_xml_to_landing.py` → file XML có trong `landing-zone`
 2. Trigger `dag_master` trên Airflow UI
 3. Kiểm tra:
-   - [ ] Bronze có dữ liệu: `SELECT count(*) FROM iceberg.bronze.raw_xml` (Trino)
+   - [ ] Bronze XML có dữ liệu: `SELECT count(*) FROM iceberg.bronze_dvc_xml.application_xml` (Trino)
+   - [ ] Silver có dữ liệu: `SELECT count(*) FROM iceberg.silver.application_events` (Trino)
+   - [ ] Gold có dữ liệu: `SELECT count(*) FROM iceberg.gold.fact_van_hanh_co_quan` (Trino)
    - [ ] Silver dedup đúng, Gold có fact
    - [ ] StarRocks Routine Load state = RUNNING, offset tăng
    - [ ] Dashboard Superset hiển thị số liệu
