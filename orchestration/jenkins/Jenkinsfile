@@ -180,41 +180,52 @@ print('YAML syntax OK')
 
     // -----------------------------------------------------------
     // Post Actions: Thông báo Telegram bất kể SUCCESS / FAILURE
+    // Dùng withCredentials để tránh lỗi secret interpolation
     // -----------------------------------------------------------
     post {
         success {
             script {
-                def msg = ""
-                if (env.BRANCH_NAME == 'dev') {
-                    msg = "✅ *STAGING DEPLOY THÀNH CÔNG*%0A" +
-                          "🔀 Branch: `${env.BRANCH_NAME}`%0A" +
-                          "🔖 Commit: `${env.GIT_COMMIT?.take(8)}`%0A" +
-                          "🏗️ Build: %23${env.BUILD_NUMBER}%0A" +
-                          "🕐 Time: `${new Date().format('yyyy-MM-dd HH:mm')}`"
+                def branchName = env.BRANCH_NAME ?: 'unknown'
+                def buildNum   = env.BUILD_NUMBER ?: '?'
+                def commitHash = (env.GIT_COMMIT ?: 'unknown').take(8)
+                def buildUrl   = env.BUILD_URL ?: 'http://localhost:8090/'
+                def msg
+                if (branchName == 'dev') {
+                    msg = "\u2705 *STAGING DEPLOY TH\u00c0NH C\u00d4NG*%0A" +
+                          "\uD83D\uDD00 Branch: `${branchName}`%0A" +
+                          "\uD83D\uDD16 Commit: `${commitHash}`%0A" +
+                          "\uD83C\uDFD7\uFE0F Build: %23${buildNum}%0A" +
+                          "\uD83D\uDD50 Time: `${new Date().format('yyyy-MM-dd HH:mm')}`"
                 } else {
-                    msg = "✅ *CI PASSED* (${env.BRANCH_NAME})%0A" +
-                          "Build %23${env.BUILD_NUMBER} — Lint & Test OK"
+                    msg = "\u2705 *CI PASSED* (${branchName})%0A" +
+                          "Build %23${buildNum} \u2014 Lint & Test OK"
                 }
-                sh """curl -s -X POST \
-                    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                    -d "chat_id=${TELEGRAM_CHAT_ID}&parse_mode=Markdown&text=${msg}" \
-                    > /dev/null || true"""
+                withCredentials([
+                    string(credentialsId: 'telegram-bot-token', variable: 'TG_TOKEN'),
+                    string(credentialsId: 'telegram-chat-id',   variable: 'TG_CHAT')
+                ]) {
+                    sh "curl -s -X POST 'https://api.telegram.org/bot${TG_TOKEN}/sendMessage' --data-urlencode 'chat_id=${TG_CHAT}' --data-urlencode 'parse_mode=Markdown' --data-urlencode 'text=${msg}' > /dev/null || true"
+                }
             }
         }
         failure {
             script {
-                def msg = "❌ *CI/CD THẤT BẠI*%0A" +
-                          "🔀 Branch: `${env.BRANCH_NAME}`%0A" +
-                          "🏗️ Build: %23${env.BUILD_NUMBER}%0A" +
-                          "🔗 Log: ${env.BUILD_URL}console"
-                sh """curl -s -X POST \
-                    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                    -d "chat_id=${TELEGRAM_CHAT_ID}&parse_mode=Markdown&text=${msg}" \
-                    > /dev/null || true"""
+                def branchName = env.BRANCH_NAME ?: 'unknown'
+                def buildNum   = env.BUILD_NUMBER ?: '?'
+                def buildUrl   = env.BUILD_URL ?: 'http://localhost:8090/'
+                def msg = "\u274C *CI/CD TH\u1EA4T B\u1EA1I*%0A" +
+                          "\uD83D\uDD00 Branch: `${branchName}`%0A" +
+                          "\uD83C\uDFD7\uFE0F Build: %23${buildNum}%0A" +
+                          "\uD83D\uDD17 Log: ${buildUrl}console"
+                withCredentials([
+                    string(credentialsId: 'telegram-bot-token', variable: 'TG_TOKEN'),
+                    string(credentialsId: 'telegram-chat-id',   variable: 'TG_CHAT')
+                ]) {
+                    sh "curl -s -X POST 'https://api.telegram.org/bot${TG_TOKEN}/sendMessage' --data-urlencode 'chat_id=${TG_CHAT}' --data-urlencode 'parse_mode=Markdown' --data-urlencode 'text=${msg}' > /dev/null || true"
+                }
             }
         }
         always {
-            // Lưu log DAG parse làm artifact
             archiveArtifacts artifacts: 'orchestration/dags/*.py', fingerprint: true, allowEmptyArchive: true
             cleanWs(cleanWhenSuccess: false)
         }
