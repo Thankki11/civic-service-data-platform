@@ -96,8 +96,8 @@ print('YAML syntax OK')
             steps {
                 echo "=== [2/4] Unit Tests ==="
                 sh '''
-                    python3 -m pip install --quiet pytest pyyaml 2>/dev/null || true
-                    pytest tests/ -v --tb=short 2>&1 || true
+                    python3 -m pip install --quiet --break-system-packages pytest pyyaml 2>/dev/null || true
+                    python3 -m pytest tests/ -v --tb=short 2>&1 || true
                 '''
             }
         }
