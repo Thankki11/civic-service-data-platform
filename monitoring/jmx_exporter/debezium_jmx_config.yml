@@ -1,0 +1,56 @@
+startDelaySeconds: 0
+ssl: false
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+
+rules:
+  # Debezium Connector & Task Metrics (PostgreSQL CDC)
+  - pattern: 'debezium\.([^:]+)<type=connector-metrics, context=([^,]+), database=([^>]+)><>([^:]+)'
+    name: debezium_metrics_$4
+    labels:
+      plugin: "$1"
+      context: "$2"
+      database: "$3"
+
+  - pattern: 'debezium\.([^:]+)<type=connector-task-metrics, context=([^,]+), database=([^,]+), task=([^>]+)><>([^:]+)'
+    name: debezium_metrics_$5
+    labels:
+      plugin: "$1"
+      context: "$2"
+      database: "$3"
+      task: "$4"
+
+  # Kafka Connect Worker Metrics
+  - pattern: 'kafka\.connect<type=connect-worker-metrics><>([^:]+)'
+    name: kafka_connect_worker_metrics_$1
+
+  - pattern: 'kafka\.connect<type=connect-worker-rebalance-metrics><>([^:]+)'
+    name: kafka_connect_worker_rebalance_metrics_$1
+
+  # Kafka Connect Connector Metrics
+  - pattern: 'kafka\.connect<type=connector-metrics, connector=([^>]+)><>([^:]+)'
+    name: kafka_connect_connector_metrics_$2
+    labels:
+      connector: "$1"
+
+  # Kafka Connect Task Metrics
+  - pattern: 'kafka\.connect<type=connector-task-metrics, connector=([^,]+), task=([^>]+)><>([^:]+)'
+    name: kafka_connect_task_metrics_$3
+    labels:
+      connector: "$1"
+      task: "$2"
+
+  # Standard JVM Metrics
+  - pattern: 'java.lang<type=OperatingSystem><>(SystemCpuLoad|ProcessCpuLoad|AvailableProcessors)'
+    name: jvm_os_$1
+
+  - pattern: 'java.lang<type=Memory><HeapMemoryUsage>(committed|init|max|used)'
+    name: jvm_memory_heap_bytes_$1
+
+  - pattern: 'java.lang<type=Memory><NonHeapMemoryUsage>(committed|init|max|used)'
+    name: jvm_memory_nonheap_bytes_$1
+
+  - pattern: 'java.lang<type=GarbageCollector, name=([^>]+)><>(CollectionCount|CollectionTime)'
+    name: jvm_gc_$2
+    labels:
+      gc_name: "$1"

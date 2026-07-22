@@ -1,0 +1,517 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "title": "Data Pipeline Status & CDC Metrics",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 5000
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 3
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "debezium_metrics_millisecondsbehindsource or debezium_metrics_MilliSecondsBehindSource or vector(0)",
+          "instant": false,
+          "legendFormat": "CDC Lag",
+          "refId": "A"
+        }
+      ],
+      "title": "CDC Replication Lag (ms)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 3
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(debezium_metrics_totalnumberofeventsseen[1m]) or rate(debezium_metrics_TotalNumberOfEventsSeen[1m]) or vector(0)",
+          "instant": false,
+          "legendFormat": "Events / sec",
+          "refId": "A"
+        }
+      ],
+      "title": "Ingestion Throughput (Events/sec)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 100
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 3
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "kafka_connect_worker_metrics_connector_count or vector(1)",
+          "instant": false,
+          "legendFormat": "Active Connectors",
+          "refId": "A"
+        }
+      ],
+      "title": "Active Connectors",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 3
+      },
+      "id": 5,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.4.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "kafka_connect_worker_metrics_task_count or vector(1)",
+          "instant": false,
+          "legendFormat": "Active Tasks",
+          "refId": "A"
+        }
+      ],
+      "title": "Active Tasks",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 15
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "debezium_metrics_millisecondsbehindsource or debezium_metrics_MilliSecondsBehindSource",
+          "legendFormat": "Replication Lag (ms) - {{context}}",
+          "refId": "A"
+        }
+      ],
+      "title": "CDC Replication Lag Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 20
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "debezium_metrics_queueremainingcapacity or debezium_metrics_QueueRemainingCapacity",
+          "legendFormat": "Queue Remaining Capacity",
+          "refId": "A"
+        }
+      ],
+      "title": "Debezium Internal Queue Capacity",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 3,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "id": 8,
+      "title": "JVM Health & Process Metrics",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 19
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jvm_memory_heap_bytes_used",
+          "legendFormat": "Heap Memory Used",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "jvm_memory_nonheap_bytes_used",
+          "legendFormat": "Non-Heap Memory Used",
+          "refId": "B"
+        }
+      ],
+      "title": "JVM Memory Consumption",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "Prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(jvm_gc_collectiontime[1m]) or rate(jvm_gc_G1_Young_Generation_CollectionTime[1m])",
+          "legendFormat": "GC Time Rate",
+          "refId": "A"
+        }
+      ],
+      "title": "JVM Garbage Collection Pause Time",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": [
+    "debezium",
+    "kafka-connect",
+    "bronze",
+    "monitoring"
+  ],
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Debezium Kafka Connect Monitoring",
+  "uid": "debezium-kafka-connect-bronze"
+}
