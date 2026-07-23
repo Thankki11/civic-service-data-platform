@@ -101,6 +101,10 @@ def bootstrap_transactional_schema():
             file_url VARCHAR(1000), "Document_Typeid" INT
         )
     ''')
+    # Debezium needs the complete UPDATE before-image so the realtime fact can
+    # validate the old status and calculate after.updated_at-before.updated_at.
+    # ALTER is idempotent and applies to both a newly created and existing table.
+    cursor.execute('ALTER TABLE "Application" REPLICA IDENTITY FULL')
     conn.commit()
     print("Transactional CDC schema is ready.")
 

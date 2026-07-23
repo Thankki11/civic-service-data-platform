@@ -36,4 +36,4 @@ Nhóm chỉ số này dùng để phân tích chuyên sâu (Drill-down) tìm ngu
 *   **Theo Nhân sự:** `fact_ton_dong_ho_so.dim_can_bo_sk = dim_can_bo.dim_can_bo_sk`. *(Với hồ sơ chưa phân công, ETL dùng member Unknown `can_bo_id = -1`.)*
 *   **Theo Thủ tục:** `fact_ton_dong_ho_so.dim_dich_vu_cong_sk = dim_dich_vu_cong.dim_dich_vu_cong_sk`; SLA dùng version có hiệu lực khi tiếp nhận.
 
-StarRocks realtime giữ dimension Type 1 theo natural key để broadcast join với Materialized View; không dùng các surrogate key SCD2 này.
+StarRocks realtime giữ dimension Type 1 theo natural key để các truy vấn phục vụ sau này join với physical realtime fact; không dùng các surrogate key SCD2 này.

@@ -14,6 +14,7 @@ services:
       - spark-network
     volumes:
       - source_db_data:/var/lib/postgresql/data
+      - ./scripts/init_postgres_databases.sh:/docker-entrypoint-initdb.d/01_databases.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U source_db -d source_db"]
       interval: 5s
@@ -58,6 +59,9 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
     networks:
       - spark-network
 
@@ -75,6 +79,32 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:29092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      - spark-network
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+      --topic postgres_server.public.Application --partitions 1 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+      --topic postgres_server.public.Application_History --partitions 1 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+      --topic postgres_server.public.Document --partitions 1 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+      --topic postgres_server.public.Applicant --partitions 1 --replication-factor 1"
     networks:
       - spark-network
 
@@ -82,8 +112,10 @@ services:
     image: debezium/connect:2.4
     container_name: debezium-connect
     depends_on:
-      - kafka
-      - source_db
+      kafka-init:
+        condition: service_completed_successfully
+      source_db:
+        condition: service_healthy
     ports:
       - "8084:8083"
     environment:
@@ -92,6 +124,33 @@ services:
       CONFIG_STORAGE_TOPIC: connect_configs
       OFFSET_STORAGE_TOPIC: connect_offsets
       STATUS_STORAGE_TOPIC: connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+    networks:
+      - spark-network
+
+  debezium-init:
+    image: civic-service-data-platform-python:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: debezium-init
+    command: ["python", "/opt/project/scripts/init_debezium.py"]
+    environment:
+      - DEBEZIUM_CONNECT_URL=http://debezium-connect:8083
+      - DEBEZIUM_CONFIG_PATH=/opt/project/ingestion/debezium_config.json
+    volumes:
+      - ./:/opt/project:ro
+    depends_on:
+      debezium-connect:
+        condition: service_healthy
     networks:
       - spark-network
 
@@ -121,36 +180,59 @@ services:
       - "8081:8081"
     volumes:
       - .:/opt/spark-data
+    environment:
+      - SPARK_WORKER_CORES=8
+      - SPARK_WORKER_MEMORY=6g
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     depends_on:
       - spark-master
     networks:
       - spark-network
 
-  spark-worker-2:
+  # Kafka -> physical realtime fact. Day la luong realtime chinh; driver submit
+  # executor len cluster Spark cu thay vi tao worker rieng.
+  spark-fact-stream:
+    build:
+      context: .
+      dockerfile: DockerFile
     image: apache_spark:3.5.1
-    container_name: spark-worker-2
-    ports:
-      - "8082:8081" # Map cổng 8082 (máy ngoài) vào cổng 8081 (nội bộ container)
+    container_name: spark-fact-stream
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - spark://spark-master:7077
+      - --jars
+      - /opt/spark/jars/starrocks-spark-connector-3.5_2.12-1.1.2.jar
+      - /opt/spark-data/transform/spark-streaming/kafka_to_starrocks_fact.py
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - APPLICATION_TOPIC=postgres_server.public.Application
+      - HISTORY_TOPIC=postgres_server.public.Application_History
+      - STARTING_OFFSETS=earliest
+      - CHECKPOINT_LOCATION=s3a://lakehouse/checkpoints/fact_xu_ly_ho_so_primary_v5_business_join
+      - STARROCKS_FE_HTTP_URL=starrocks:8080
+      - STARROCKS_FE_JDBC_URL=jdbc:mysql://starrocks:9030
+      - STARROCKS_TABLE=gold_realtime.fact_xu_ly_ho_so_stream
+      - STARROCKS_USER=root
+      - STARROCKS_PASSWORD=
+      - SPARK_CORES_MAX=2
+      - SPARK_EXECUTOR_CORES=2
+      - SPARK_EXECUTOR_MEMORY=1g
+      - SPARK_SHUFFLE_PARTITIONS=2
     volumes:
       - .:/opt/spark-data
-    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     depends_on:
-      - spark-master
-    networks:
-      - spark-network
-
-
-  spark-worker-3:
-    image: apache_spark:3.5.1
-    container_name: spark-worker-3
-    ports:
-      - "8083:8081"
-    volumes:
-      - .:/opt/spark-data
-    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
-    depends_on:
-      - spark-master
+      spark-master:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+      debezium-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      starrocks-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
     networks:
       - spark-network
 
@@ -165,23 +247,7 @@ services:
     networks:
       - spark-network
     volumes:
-      - K:\Data_Platform\nifi_extensions\nifi-iceberg-processors-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-iceberg-processors-nar-1.25.0.nar
-      - K:\Data_Platform\nifi_extensions\nifi-iceberg-services-api-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-iceberg-services-api-nar-1.25.0.nar
-      - K:\Data_Platform\nifi_extensions\nifi-iceberg-services-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-iceberg-services-nar-1.25.0.nar
-      - K:\Data_Platform\nifi_extensions\nifi-hive-services-api-nar-1.25.0.nar:/opt/nifi/nifi-current/lib/nifi-hive-services-api-nar-1.25.0.nar
-      - K:\Data_Platform\nifi_core_site.xml:/opt/nifi/nifi-current/conf/core-site.xml
-
-  metastore-db:
-    image: postgres:11
-    container_name: metastore-db
-    environment:
-      POSTGRES_DB: metastore
-      POSTGRES_USER: hive
-      POSTGRES_PASSWORD: hive
-    ports:
-      - "5434:5432"
-    networks:
-      - spark-network
+      - ./nifi_core_site.xml:/opt/nifi/nifi-current/conf/core-site.xml:ro
 
   hive-metastore:
     image: starburstdata/hive:3.1.2-e.18
@@ -189,10 +255,10 @@ services:
     ports:
       - "9083:9083"
     environment:
-      HIVE_METASTORE_JDBC_URL: jdbc:postgresql://metastore-db:5432/metastore
+      HIVE_METASTORE_JDBC_URL: jdbc:postgresql://source_db:5432/metastore
       HIVE_METASTORE_DRIVER: org.postgresql.Driver
-      HIVE_METASTORE_USER: hive
-      HIVE_METASTORE_PASSWORD: hive
+      HIVE_METASTORE_USER: source_db
+      HIVE_METASTORE_PASSWORD: source_db
       S3_ENDPOINT: http://minio:9000
       S3_ACCESS_KEY: minio_access_key
       S3_SECRET_KEY: minio_secret_key
@@ -212,7 +278,8 @@ services:
       AZURE_WASB_STORAGE_ACCOUNT: "none"
       AZURE_WASB_ACCESS_KEY: "none"
     depends_on:
-      - metastore-db
+      source_db:
+        condition: service_healthy
     networks:
       - spark-network
 
@@ -233,9 +300,7 @@ services:
       - spark-network
 
   # StarRocks (FE+BE trong 1 container - phu hop moi truong dev/demo).
-  # Hostname "starrocks" phai khop voi warehouse/superset/CONNECTIONS.md
-  # (starrocks://root:@starrocks:9030/) va voi transform/starrocks/*.sql
-  # (kafka_broker_list tro toi service "kafka" tren cung spark-network).
+  # Spark Structured Streaming ghi physical fact qua Stream Load HTTP.
   starrocks:
     image: starrocks/allin1-ubuntu:latest
     container_name: starrocks
@@ -250,6 +315,18 @@ services:
       - spark-network
     depends_on:
       - kafka
+
+  starrocks-init:
+    image: mysql:8.0
+    container_name: starrocks-init
+    entrypoint: ["/bin/sh", "/opt/project/scripts/init_starrocks.sh"]
+    volumes:
+      - ./:/opt/project:ro
+    depends_on:
+      starrocks:
+        condition: service_started
+    networks:
+      - spark-network
 
   mock-api:
     image: civic-service-data-platform-python:latest
@@ -282,8 +359,10 @@ services:
       - DB_HOST=source_db
       - DB_PORT=5432
     depends_on:
-      - source_db
-      - kafka
+      source_db:
+        condition: service_healthy
+      debezium-init:
+        condition: service_completed_successfully
 
   data-master-gen:
     image: civic-service-data-platform-python:latest
@@ -322,6 +401,9 @@ volumes:
   minio_storage:
   source_db_data:
   starrocks_data:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:
 
 
 networks:

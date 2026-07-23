@@ -20,6 +20,13 @@ RUN curl -fsSL \
 RUN curl -fsSL \
   "https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.0.33/mysql-connector-j-8.0.33.jar" \
   -o /opt/spark/jars/mysql-connector-j-8.0.33.jar
+
+# StarRocks DataSource V2 connector: ho tro Spark 3.5 Structured Streaming va
+# ghi qua Stream Load. Pin version de image build co tinh lap lai.
+RUN curl -fsSL \
+  "https://repo1.maven.org/maven2/com/starrocks/starrocks-spark-connector-3.5_2.12/1.1.2/starrocks-spark-connector-3.5_2.12-1.1.2.jar" \
+  -o /opt/spark/jars/starrocks-spark-connector-3.5_2.12-1.1.2.jar
+
 RUN curl -fsSL \
   "https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.1/spark-sql-kafka-0-10_2.12-3.5.1.jar" \
   -o /opt/spark/jars/spark-sql-kafka-0-10_2.12-3.5.1.jar
