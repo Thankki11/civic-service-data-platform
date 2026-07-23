@@ -92,6 +92,9 @@ services:
       CONFIG_STORAGE_TOPIC: connect_configs
       OFFSET_STORAGE_TOPIC: connect_offsets
       STATUS_STORAGE_TOPIC: connect_statuses
+      JAVA_TOOL_OPTIONS: "-javaagent:/kafka/etc/jmx_exporter/jmx_prometheus_javaagent-0.20.0.jar=9999:/kafka/etc/jmx_exporter/debezium_jmx_config.yml"
+    volumes:
+      - ./monitoring/jmx_exporter:/kafka/etc/jmx_exporter
     networks:
       - spark-network
 
@@ -182,6 +185,7 @@ services:
       - "5434:5432"
     networks:
       - spark-network
+  
 
   hive-metastore:
     image: starburstdata/hive:3.1.2-e.18
@@ -317,6 +321,35 @@ services:
       - PYTHONIOENCODING=utf-8
     depends_on:
       - minio
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - spark-network
+    depends_on:
+      - debezium-connect
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      - spark-network
+    depends_on:
+      - prometheus
 
 volumes:
   minio_storage:

@@ -1,5 +1,6 @@
 """
 Generate mock XML packet cho ĐÚNG schema thật trong báo cáo thực tập (dựa theo ERD)
+Tự động phân bổ và lưu trữ theo từng ngày trong khoảng N ngày (mặc định 5 ngày)
 """
 
 import os
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta
 from lxml import etree
 from faker import Faker
 import boto3
-import io
+from collections import defaultdict
 
 # Cấu hình MinIO
 MINIO_ENDPOINT = os.environ.get('MINIO_ENDPOINT', 'http://localhost:9002')
@@ -33,14 +34,17 @@ except Exception as e:
 fake = Faker('vi_VN')
 random.seed(7)
 
-now = datetime.now()
-OUTPUT_DIR = f'raw/xml/dvc/{now.strftime("%Y/%m/%d")}'
+# Cấu hình số ngày mô phỏng và số lượng hồ sơ
+NUM_DAYS = 5
+NUM_HO_SO = 200
+BASE_OUTPUT_DIR = 'raw/xml/dvc'
 
-if os.path.exists(OUTPUT_DIR):
-    shutil.rmtree(OUTPUT_DIR)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+if os.path.exists(BASE_OUTPUT_DIR):
+    shutil.rmtree(BASE_OUTPUT_DIR)
+os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
 
 manifest_rows = []
+packets_per_day = defaultdict(int)
 _counter = {}
 
 def next_id(prefix, width=6):
@@ -66,9 +70,8 @@ def build_metadata(root, ma_goi_tin, su_kien, id_ho_so, ngay_cap_nhat):
     return md
 
 def write_packet(scenario, ma_goi_tin, root_el, su_kien, id_ho_so, t, note=''):
-    folder = f"{OUTPUT_DIR}/{scenario}"
-    file_name = f"{ma_goi_tin}.xml"
-    s3_path = f"{folder}/{file_name}"
+    date_path = t.strftime("%Y/%m/%d")
+    s3_path = f"{BASE_OUTPUT_DIR}/{date_path}/{ma_goi_tin}.xml"
     
     xml_data = etree.tostring(root_el, encoding='utf-8', xml_declaration=True, pretty_print=True)
     
@@ -76,12 +79,12 @@ def write_packet(scenario, ma_goi_tin, root_el, su_kien, id_ho_so, t, note=''):
         try:
             s3_client.put_object(Bucket=BUCKET_NAME, Key=s3_path, Body=xml_data, ContentType='application/xml')
         except Exception as e:
-            print(f"Lỗi đẩy lên MinIO: {e}")
+            print(f"Lỗi đẩy lên MinIO ({s3_path}): {e}")
     else:
-        # Fallback local
-        local_folder = os.path.join(OUTPUT_DIR, scenario)
+        # Fallback local nếu không kết nối được MinIO
+        local_folder = os.path.join(BASE_OUTPUT_DIR, t.strftime("%Y"), t.strftime("%m"), t.strftime("%d"))
         os.makedirs(local_folder, exist_ok=True)
-        with open(os.path.join(local_folder, file_name), 'wb') as f:
+        with open(os.path.join(local_folder, f"{ma_goi_tin}.xml"), 'wb') as f:
             f.write(xml_data)
 
     manifest_rows.append({
@@ -89,6 +92,7 @@ def write_packet(scenario, ma_goi_tin, root_el, su_kien, id_ho_so, t, note=''):
         'ma_goi_tin': ma_goi_tin, 'kich_ban': scenario, 'su_kien': su_kien,
         'id_ho_so': id_ho_so, 'ngay_cap_nhat': t.strftime('%Y-%m-%d %H:%M:%S'), 'ghi_chu': note,
     })
+    packets_per_day[date_path] += 1
 
 SERVICE_IDS = [1, 2]
 AGENCY_IDS = [1, 2, 3]
@@ -201,12 +205,20 @@ def gen_history_entry(status_code_truoc, status_code_sau, officer_id, t, note=No
         'note': note,
     }
 
-NUM_HO_SO = 200
 now = datetime.now()
+start_base = (now - timedelta(days=NUM_DAYS - 1)).replace(hour=8, minute=0, second=0, microsecond=0)
 
 for h in range(1, NUM_HO_SO + 1):
     id_ho_so = next_id('HS')
-    t = now - timedelta(days=random.randint(3, 45))
+    
+    # Chọn ngày bắt đầu ngẫu nhiên trong khoảng NUM_DAYS ngày
+    day_offset = random.randint(0, NUM_DAYS - 1)
+    hour_offset = random.randint(0, 9)
+    minute_offset = random.randint(0, 59)
+    
+    t = start_base + timedelta(days=day_offset, hours=hour_offset, minutes=minute_offset)
+    if t > now:
+        t = now - timedelta(hours=random.randint(1, 10))
 
     docs = {}
     for _ in range(random.randint(2, 4)):
@@ -251,7 +263,7 @@ for h in range(1, NUM_HO_SO + 1):
 
     rut_ho_so = False
     for step in STATUS_FLOW:
-        t = t + timedelta(hours=random.randint(2, 36))
+        t = t + timedelta(hours=random.randint(1, 6), minutes=random.randint(0, 59))
 
         if random.random() < 0.30:
             d = random.choice(list(docs.values()))
@@ -261,7 +273,7 @@ for h in range(1, NUM_HO_SO + 1):
             build_metadata(root, ma_goi_tin, 'UPDATE', id_ho_so, t)
             write_du_lieu(root, ho_so, mode='PARTIAL', doc_items=[(d, 'UPDATE')])
             write_packet('UPDATE_DOCUMENT_PARTIAL', ma_goi_tin, root, 'UPDATE', id_ho_so, t)
-            t = t + timedelta(hours=random.randint(1, 6))
+            t = t + timedelta(hours=random.randint(1, 3))
 
         if random.random() < 0.15:
             d = gen_document()
@@ -271,7 +283,7 @@ for h in range(1, NUM_HO_SO + 1):
             build_metadata(root, ma_goi_tin, 'UPDATE', id_ho_so, t)
             write_du_lieu(root, ho_so, mode='PARTIAL', doc_items=[(d, 'ADD')])
             write_packet('UPDATE_DOCUMENT_ADD', ma_goi_tin, root, 'UPDATE', id_ho_so, t)
-            t = t + timedelta(hours=random.randint(1, 6))
+            t = t + timedelta(hours=random.randint(1, 3))
 
         if not da_dong_le_phi and random.random() < 0.35:
             p = gen_payment(t)
@@ -282,7 +294,7 @@ for h in range(1, NUM_HO_SO + 1):
             build_metadata(root, ma_goi_tin, 'UPDATE', id_ho_so, t)
             write_du_lieu(root, ho_so, mode='PARTIAL', pay_items=[(p, 'ADD')])
             write_packet('UPDATE_PAYMENT_ADD', ma_goi_tin, root, 'UPDATE', id_ho_so, t)
-            t = t + timedelta(hours=random.randint(1, 6))
+            t = t + timedelta(hours=random.randint(1, 3))
 
         if random.random() < 0.02:
             root = etree.Element('packet')
@@ -328,7 +340,7 @@ for h in range(1, NUM_HO_SO + 1):
             break
 
     if not rut_ho_so and random.random() < 0.05:
-        t = t + timedelta(hours=random.randint(1, 12))
+        t = t + timedelta(hours=random.randint(1, 6))
         root = etree.Element('packet')
         ma_goi_tin = next_id('PKG')
         build_metadata(root, ma_goi_tin, 'UPDATE', id_ho_so, t)
@@ -338,12 +350,29 @@ for h in range(1, NUM_HO_SO + 1):
                       hist_items=None)
         write_packet('UPDATE_FULL', ma_goi_tin, root, 'UPDATE', id_ho_so, t)
 
-print(f"- Tổng số hồ sơ: {NUM_HO_SO}")
-manifest_path = os.path.join(OUTPUT_DIR, 'manifest.csv')
-with open(manifest_path, 'w', newline='', encoding='utf-8-sig') as f:
-    writer = csv.DictWriter(f, fieldnames=['file_path', 'ma_goi_tin', 'kich_ban', 'su_kien',
-                                            'id_ho_so', 'ngay_cap_nhat', 'ghi_chu'])
+print(f"- Tổng số hồ sơ sinh ra: {NUM_HO_SO}")
+print(f"- Số ngày mô phỏng: {NUM_DAYS} ngày")
+
+manifest_path = os.path.join(BASE_OUTPUT_DIR, 'manifest.csv')
+fieldnames = ['file_path', 'ma_goi_tin', 'kich_ban', 'su_kien', 'id_ho_so', 'ngay_cap_nhat', 'ghi_chu']
+
+if s3_client:
+    import io
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(manifest_rows)
+    try:
+        s3_client.put_object(Bucket=BUCKET_NAME, Key=f"{BASE_OUTPUT_DIR}/manifest.csv", Body=buf.getvalue().encode('utf-8-sig'), ContentType='text/csv')
+    except Exception as e:
+        print(f"Lỗi đẩy manifest.csv lên MinIO: {e}")
+else:
+    with open(manifest_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(manifest_rows)
 
-print(f"\nTỔNG SỐ PACKET: {len(manifest_rows)}")
+print(f"\nTỔNG SỐ PACKET XML ĐÃ SINH: {len(manifest_rows)}")
+print("\nTHỐNG KÊ GÓI TIN THEO TỪNG NGÀY (TRÊN MINIO):")
+for day in sorted(packets_per_day.keys()):
+    print(f"  📅 Ngày {day}: {packets_per_day[day]} gói tin XML (s3://{BUCKET_NAME}/{BASE_OUTPUT_DIR}/{day}/*.xml)")
