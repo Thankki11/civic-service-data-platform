@@ -15,10 +15,12 @@ Gold dimensions
 Gold fact_ton_dong_ho_so + fact_van_hanh_co_quan
 
 Real-time
-Debezium/Kafka Application -----------------> Routine Load -> ods_application_rt (PK/upsert)
-Debezium/Kafka Application_History ---------> Routine Load -> ods_application_history_rt (Duplicate/append)
-                                                               -> fact_xu_ly_ho_so (Async MV)
-                                                               -> vw_fact_xu_ly_ho_so_bi (dim broadcast join)
+Debezium/Kafka Application -----------------+
+                                             +-> Spark stream-stream join (5s)
+Debezium/Kafka Application_History ---------+       -> fact_xu_ly_ho_so_stream (physical PK)
+
+Debezium/Kafka Application/History/Document/Applicant
+                                             -> ingest team -> Bronze Iceberg
 ```
 
 Hai đường cùng dùng các khóa nghiệp vụ `ho_so_id`, `co_quan_id`, `dv_cong_id`, `trang_thai_id`, `can_bo_id` và `thoi_gian_id`. Batch tối ưu cho snapshot/aggregate theo ngày; StarRocks tối ưu drill-down sự kiện gần thời gian thực.
@@ -31,7 +33,7 @@ Hai đường cùng dùng các khóa nghiệp vụ `ho_so_id`, `co_quan_id`, `dv
 | `silver.application_history` | 1 dòng / hành động | XML + CDC | Nhật ký bất biến, union hai input rồi append chống trùng theo `history_id`; partition Iceberg theo `days(action_time)`. |
 | `gold.fact_ton_dong_ho_so` | 1 dòng / hồ sơ mở / ngày | Silver application + history + dim SCD2 | Snapshot backlog ở 23:59:59, mang surrogate key version của dim. |
 | `gold.fact_van_hanh_co_quan` | 1 dòng / cơ quan / ngày | Các fact/nguồn Silver + dim SCD2 | KPI lãnh đạo và version cơ quan tại ngày chốt. |
-| `gold_realtime.fact_xu_ly_ho_so` | 1 dòng / hành động | StarRocks ODS history + application | Duration từng bước xử lý realtime. |
+| `gold_realtime.fact_xu_ly_ho_so_stream` | 1 dòng / hành động | Spark join Application + Application_History CDC | Physical realtime fact, duration từng bước xử lý. |
 
 Trạng thái: `RECEIVED(1) -> ASSIGNED(2) -> PROCESSING(3) -> PENDING_APPROVAL(4) -> APPROVED(5) -> READY(6) -> COMPLETED(7)`; `REJECTED(8)` là trạng thái kết thúc.
 
@@ -41,8 +43,15 @@ Trạng thái: `RECEIVED(1) -> ASSIGNED(2) -> PROCESSING(3) -> PENDING_APPROVAL(
 
 1. Docker Desktop/Engine đang chạy.
 2. Bronze master data cần sẵn sàng. XML, CDC và API được đọc độc lập và union khi cùng tạo một thực thể Silver; bảng input chưa được ingest chỉ bị bỏ qua riêng input đó.
-3. Lần đầu chạy StarRocks cần tạo schema trước khi `build_dim_tables.py` ghi JDBC.
-4. `data-master-gen` cần chạy ít nhất một lần để tạo master data và schema OLTP mà simulator CDC dùng.
+3. Compose tự tạo Kafka topic, đăng ký Debezium connector và tạo bảng StarRocks bằng các init service idempotent. Cấu hình PostgreSQL CDC và job Kafka → Bronze thuộc phạm vi ingest.
+   Riêng `public."Application"` phải có `REPLICA IDENTITY FULL` để Debezium gửi
+   `before.Statusid` và `before.updated_at` cho fact realtime; đây là migration
+   một lần ở source, không cần một PostgreSQL init container chạy thường trực.
+4. PostgreSQL `source_db` chứa hai database tách biệt: `source_db` cho OLTP/CDC và
+   `metastore` cho Hive metadata. Init script tạo `metastore` khi volume PostgreSQL
+   được khởi tạo lần đầu, nên không cần container PostgreSQL thứ hai.
+5. Chỉ khi dùng simulator demo, `data-master-gen` cần chạy trước để tạo schema và
+   master data mà simulator tham chiếu.
 
 Các bucket `landing-zone`, `lakehouse`, `quarantine-zone` được service `minio-init` tạo tự động khi compose khởi động.
 
@@ -53,18 +62,19 @@ Từ PowerShell, tại root project:
 ```powershell
 docker compose up -d --build
 docker compose ps
-docker compose --profile manual run --rm data-master-gen
 ```
 
-Đăng ký Debezium sau khi Postgres đã có bảng giao dịch:
+`data-master-gen` chỉ chạy thủ công khi cần bootstrap dữ liệu demo; nó không
+được tự khởi động cùng hạ tầng và không phải dependency của transform.
+
+`docker compose up` tự khởi động `spark-fact-stream`. Container này chỉ giữ
+Spark driver; executor chạy trên một worker local được giới hạn 8 cores/6 GB.
+Kiểm tra connector và realtime stream:
 
 ```powershell
-Invoke-RestMethod -Method Post `
-  -Uri 'http://localhost:8084/connectors' `
-  -ContentType 'application/json' `
-  -InFile '.\ingestion\debezium_config.json'
-
 Invoke-RestMethod -Uri 'http://localhost:8084/connectors/postgres-connector/status'
+docker compose ps spark-fact-stream
+docker compose logs --tail=100 spark-fact-stream
 ```
 
 Khi cần sinh CDC realtime:
@@ -73,46 +83,59 @@ Khi cần sinh CDC realtime:
 docker compose --profile streaming up -d stream-simulator
 ```
 
-`stream-simulator` được đặt trong profile riêng để không ghi lỗi vào Postgres trước khi schema OLTP và Debezium sẵn sàng.
+`stream-simulator` vẫn ở profile riêng vì chỉ là nguồn sinh sự kiện demo, không
+phải thành phần production của pipeline.
 
 ## 5. Thứ tự chạy transform lần đầu
 
 ### 5.1 Tạo StarRocks serving schema
 
-```powershell
-Get-Content '.\transform\starrocks\ddl_realtime.sql' -Raw |
-  docker exec -i starrocks mysql -h 127.0.0.1 -P 9030 -uroot
-```
-
-Nếu database `gold_realtime` được tạo bằng DDL cũ, phải reset riêng database đó và hai Routine Load trước. `CREATE TABLE IF NOT EXISTS` không thể đổi kiểu `history.id` hoặc key model của bảng có sẵn.
+`starrocks-init` chạy `ddl_realtime.sql` và `ddl_streaming_fact.sql` để tạo năm
+dimension mirror và physical fact. Nó không tạo semantic/BI view.
+Spark ghi qua FE proxy tích hợp của image all-in-one tại `starrocks:8080`; proxy
+theo Stream Load redirect tới BE loopback bên trong đúng container StarRocks.
 
 ### 5.2 Đưa dữ liệu vào Bronze bằng các ingest job có sẵn
 
-Phần này là precondition của transform. Với CDC Bronze, Spark streaming job phải đang chạy để có `application_cdc`, `application_history_cdc`, `document_cdc`, `applicant_cdc`.
+Các job ingest của nhóm phụ trách nguồn tạo `application_cdc`,
+`application_history_cdc`, `document_cdc`, `applicant_cdc`. Transform chỉ coi
+các bảng Bronze này là input contract và không điều phối ingest.
 
 ### 5.3 Bronze → Silver
 
 ```powershell
-docker exec spark-master /opt/spark/bin/spark-submit `
-  --master spark://spark-master:7077 `
+docker compose exec -T spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --conf spark.cores.max=4 `
+  --executor-cores 4 --executor-memory 3g `
   /opt/spark-data/transform/spark-etl/bronze_to_silver.py
 ```
+
+Lệnh `docker compose exec` chỉ là cách chạy tay khi Airflow chưa được cài. Khi có
+Airflow, `SparkSubmitOperator` trên Airflow worker thay thế lệnh này và giữ vai
+trò driver client-mode; Compose không tạo batch driver container riêng.
 
 ### 5.4 Build dimensions
 
 Chạy lần đầu và chạy lại khi Agency/Status/Service/Officer/Role hoặc lịch nghỉ thay đổi.
 
 ```powershell
-docker exec spark-master /opt/spark/bin/spark-submit `
-  --master spark://spark-master:7077 `
+docker compose exec -T spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --conf spark.cores.max=4 `
+  --executor-cores 4 --executor-memory 3g `
   /opt/spark-data/transform/spark-agg/build_dim_tables.py
 ```
+
+`dim_thoi_gian` giữ lịch sử từ `CALENDAR_START_DATE=2023-01-01`, nhưng tương lai
+chỉ đến ngày hiện tại cộng `CALENDAR_DAYS_AHEAD=7`. Mỗi ngày job chỉ thêm ngày
+còn thiếu; nếu bản demo cũ đã sinh xa hơn horizon thì phần tương lai dư được
+xóa khỏi cả Iceberg và StarRocks.
 
 ### 5.5 Silver → Gold batch
 
 ```powershell
-docker exec spark-master /opt/spark/bin/spark-submit `
-  --master spark://spark-master:7077 `
+docker compose exec -T spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --conf spark.cores.max=4 `
+  --executor-cores 4 --executor-memory 3g `
   /opt/spark-data/transform/spark-agg/silver_to_gold.py
 ```
 
@@ -121,25 +144,54 @@ Job chốt số cho **hôm qua**. Hai Gold fact là periodic snapshot: job thay 
 Backfill chạy từng ngày để mỗi lần ghi là một Iceberg commit atomic và dễ retry:
 
 ```powershell
-docker exec spark-master /opt/spark/bin/spark-submit `
+docker compose exec -T spark-master /opt/spark/bin/spark-submit `
   --master spark://spark-master:7077 `
-  /opt/spark-data/transform/spark-agg/silver_to_gold.py `
-  --snapshot-date 2026-07-15
+  --conf spark.cores.max=4 --executor-cores 4 --executor-memory 3g `
+  /opt/spark-data/transform/spark-agg/silver_to_gold.py --snapshot-date 2026-07-15
 ```
 
 Khi backfill, `Application` chỉ dùng cho các thuộc tính bất biến (`created_at`, `co_quan_id`, `dv_cong_id`...). Trạng thái mở/đóng của hồ sơ luôn là event mới nhất trong `Application_History` không vượt quá `23:59:59` của ngày backfill; vì vậy `Statusid` hiện tại trong `Application` không làm sai snapshot quá khứ. Backfill dùng để tạo/điều chỉnh ảnh chụp Gold cho ngày quá khứ khi Bronze/Silver đã nhận dữ liệu muộn, không phải để sinh thêm dữ liệu hằng ngày.
 
-### 5.6 Tạo Routine Load realtime
+### 5.6 Spark Structured Streaming StarRocks
 
-```powershell
-Get-Content '.\transform\starrocks\routine_load.sql' -Raw |
-  docker exec -i starrocks mysql -h 127.0.0.1 -P 9030 -uroot
+Compose không còn batch driver service. Airflow sau này submit từng application
+theo thứ tự; process task trên Airflow worker chạy driver client-mode, còn
+scheduler/webserver Airflow không kiêm driver. Mỗi application vẫn là một task
+riêng để retry và quan sát độc lập.
 
-docker exec -it starrocks mysql -h 127.0.0.1 -P 9030 -uroot `
-  -e 'SHOW ROUTINE LOAD FROM gold_realtime\G'
+`docker compose up -d` tự chạy `spark-fact-stream`: join
+`Application.id = Application_History.Applicationid` và khớp cặp trạng thái,
+rồi ghi physical Primary Key
+fact trong StarRocks. `debezium-init` tự POST/PUT connector; `starrocks-init` tự
+tạo bảng trước khi driver được phép start. Service có `restart: unless-stopped`.
+
+Job dùng trigger 5 giây, watermark 1 phút và checkpoint riêng trên MinIO.
+Compose đặt `STARTING_OFFSETS=earliest` để lần chạy đầu không bỏ sót event đã có
+trong Kafka; các lần restart sau Spark tiếp tục từ offsets trong checkpoint.
+Muốn replay phải dùng một checkpoint path mới, không tái sử dụng checkpoint cũ.
+
+Kiểm tra đường realtime chính:
+
+```sql
+SELECT COUNT(*), MAX(fact_loaded_at)
+FROM gold_realtime.fact_xu_ly_ho_so_stream;
 ```
 
-Ở các ngày tiếp theo, thứ tự batch chỉ là Bronze sẵn sàng → `bronze_to_silver.py` → `silver_to_gold.py`. Dimensions không cần build hằng ngày nếu danh mục không đổi.
+`kafka_to_fact_latency_ms` lấy Kafka record timestamp tới thời điểm Spark bắt
+đầu gửi dòng fact qua Stream Load. Nó phản ánh Kafka wait + trigger + join và
+thiếu vài mili giây commit/visibility của StarRocks. Nếu cần đo end-to-end tuyệt
+đối, cần thêm probe bên ngoài ghi nhận lúc một `history_id` truy vấn thấy được.
+
+Checkpoint trên MinIO có thêm network I/O ở cuối micro-batch, nhưng với state
+join chỉ giữ một phút và trigger 5 giây thì chi phí thường nhỏ hơn đáng kể so với
+chu kỳ trigger. Đây không phải một database mới: Spark dùng state store mặc định
+và MinIO chỉ giữ log/checkpoint bền vững để phục hồi. Không đặt checkpoint trên
+filesystem của container vì mất worker hoặc recreate container sẽ mất khả năng
+resume an toàn.
+
+Ở các ngày tiếp theo, Airflow chạy: Bronze sẵn sàng → `bronze_to_silver.py` →
+`build_dim_tables.py` → `silver_to_gold.py`. Dimension job chạy lại hằng ngày
+vẫn idempotent và đồng thời bổ sung ngày còn thiếu cho `dim_thoi_gian`.
 
 ## 6. Mô tả từng file transform
 
@@ -178,20 +230,20 @@ docker exec -it starrocks mysql -h 127.0.0.1 -P 9030 -uroot `
 
 File này xây cả Iceberg Gold và StarRocks dimensions trong cùng một lần chạy.
 
-- `dim_thoi_gian`: date spine demo 2023–2028, thứ/ngày/tháng/quý/năm, cờ nghỉ và `stt_ngay_lam_viec` tích lũy.
+- `dim_thoi_gian`: giữ lịch sử từ 2023, chỉ sinh tăng dần đến `today + 7 ngày`, gồm thứ/ngày/tháng/quý/năm, cờ nghỉ và `stt_ngay_lam_viec` tích lũy.
 - `stt_ngay_lam_viec` là kỹ thuật quan trọng: thay vì join mọi ngày trong một khoảng thời gian, số ngày làm việc = `seq_ngày_kết_thúc - seq_ngày_bắt_đầu`.
 - `dim_co_quan`: Agency join Province/Ward bằng Spark broadcast; Iceberg Gold lưu SCD2 theo thay đổi tên/địa bàn.
 - `dim_trang_thai`: map id/code/name, có version SCD2 để không đổi nhãn lịch sử nếu danh mục bị sửa.
 - `dim_can_bo`: Officer join Officer_Role/Role, chọn một role đại diện, thêm member `-1`, và lưu SCD2 khi tên/vị trí đổi.
 - `dim_dich_vu_cong`: Service, trong đó `processing_time` trở thành SLA `thoi_han_tra_kq`; đây là SCD2 quan trọng nhất.
-- Iceberg batch dùng SCD2 (`*_sk`, `effective_from_ts`, `effective_to_ts`, `is_current`). Thay đổi được phát hiện bằng so sánh null-safe trực tiếp các tracked column nghiệp vụ; StarRocks giữ Type 1 current-state trong Primary Key table để MV realtime broadcast join nhanh.
+- Iceberg batch dùng SCD2 (`*_sk`, `effective_from_ts`, `effective_to_ts`, `is_current`). Thay đổi được phát hiện bằng so sánh null-safe trực tiếp các tracked column nghiệp vụ; StarRocks giữ Type 1 current-state trong Primary Key table để truy vấn realtime có thể broadcast join khi xây lớp BI sau này.
 - Vì dimension nhỏ, JDBC ghi theo `coalesce(1)`, batch 1.000 dòng và `rewriteBatchedStatements`.
 
 ### `spark-agg/silver_to_gold.py`
 
 **Quy ước thời gian**
 
-- `snapshot_date = hôm qua`; `cutoff_ts = 23:59:59` của ngày đó.
+- `snapshot_date = hôm qua` theo UTC+07:00; `cutoff_ts = 23:59:59` của ngày đó.
 - Fact Gold partition theo `thoi_gian_id = yyyymmdd`.
 - Hai fact Gold là periodic snapshot, do đó replace duy nhất partition `thoi_gian_id` của ngày chốt thay vì `APPEND` hoặc `MERGE` theo dòng.
 
@@ -217,18 +269,20 @@ File này xây cả Iceberg Gold và StarRocks dimensions trong cùng một lầ
 
 ### `starrocks/ddl_realtime.sql`
 
-- `ods_application_rt`: Primary Key `(ho_so_id)`, mirror current state để upsert CDC nhanh.
-- `ods_application_history_rt`: Duplicate Key append-only, sort `(ho_so_id, action_time, id)` và hash cùng `ho_so_id`; phù hợp window `LAG` theo hồ sơ.
-- 5 dimensions mirror có Primary Key, nạp bởi `build_dim_tables.py`.
-- `fact_xu_ly_ho_so`: Async MV refresh 60 giây (mức tối thiểu của StarRocks 4.1). `LAG(action_time)` tính duration một bước; KPI quá hạn chỉ đánh giá ở event `COMPLETED` bằng ngày làm việc toàn hồ sơ, không so duration một bước với SLA toàn dịch vụ.
-- `vw_fact_xu_ly_ho_so_bi`: semantic view cho BI, broadcast join tất cả dim nhỏ ở phía phải.
+- Tạo 5 Primary Key dimension mirror, được nạp bởi `build_dim_tables.py`.
 
-### `starrocks/routine_load.sql`
+### `starrocks/ddl_streaming_fact.sql`
 
-- `rl_application`: Kafka topic `postgres_server.public.Application` vào PK ODS. `c/u/r` là upsert; `d` lấy key bằng `COALESCE(payload.after.id, payload.before.id)` rồi gán `__op=1` để delete.
-- Debezium đã tắt tombstone để Routine Load không nhận record `null` sau delete.
-- `rl_application_history`: chỉ nhận `c/r`; `cdc_op` là cột kỹ thuật trong ODS để StarRocks 4.1 lọc hợp lệ. Update/delete history là vi phạm quy ước append-only và không được làm phát sinh event fact.
-- Routine Load exactly-once theo offset/transaction; `desired_concurrent_number=1` đúng với demo một Kafka partition/một BE.
+- `fact_xu_ly_ho_so_stream`: physical Primary Key `(ho_so_id, id)` do Spark ghi.
+- Không tạo view BI; phần trình bày sẽ tự join fact với dimension khi được triển khai.
+
+### `spark-streaming/kafka_to_starrocks_fact.py`
+
+- Đọc hai topic bằng hai Kafka streaming source độc lập.
+- Join `Application.id = Application_History.Applicationid` cùng cặp trạng thái trước/sau. `source.txId` chỉ được giữ làm metadata đối soát, không còn là điều kiện join. Watermark và time range một phút chỉ giới hạn streaming state.
+- `thoi_gian_xu_ly` lấy `Application.after.updated_at - Application.before.updated_at`; `Application_History.action_time` vẫn là thời điểm nghiệp vụ của fact. Event tạo hồ sơ đầu tiên có duration `NULL`.
+- Ghi `fact_xu_ly_ho_so_stream` bằng StarRocks Spark Connector, trigger và connector flush cùng 5 giây. Primary Key `(ho_so_id, id)` làm replay/retry idempotent.
+- Lưu Kafka partition/offset, source time và các latency millisecond để đối soát và giám sát.
 
 ### `warehouse/ddl/gold_dim_fact.sql` và `warehouse/validation/*`
 
@@ -238,25 +292,13 @@ File này xây cả Iceberg Gold và StarRocks dimensions trong cùng một lầ
 ## 7. Kiểm tra sau khi chạy
 
 ```sql
--- StarRocks: Routine Load phải RUNNING, Progress tăng.
-SHOW ROUTINE LOAD FROM gold_realtime;
+-- Physical fact tăng và timestamp load gần thời gian hiện tại.
+SELECT COUNT(*), MAX(fact_loaded_at)
+FROM gold_realtime.fact_xu_ly_ho_so_stream;
 
--- History giữ đúng ID chuỗi và không bị null do cast sai.
-SELECT id, ho_so_id, action_time
-FROM gold_realtime.ods_application_history_rt
-WHERE id IS NULL OR id = '';
-
--- KPI quá hạn chỉ có ý nghĩa tại COMPLETED.
-SELECT f.*
-FROM gold_realtime.fact_xu_ly_ho_so f
-JOIN gold_realtime.dim_trang_thai s ON f.trang_thai_id = s.trang_thai_id
-WHERE s.ma_trang_thai <> 'COMPLETED'
-  AND (f.tong_ngay_lam_viec_xu_ly IS NOT NULL OR f.co_bi_qua_han <> 0);
-
--- BI view: EXPLAIN phải thấy BROADCAST cho các dimension nhỏ.
-EXPLAIN SELECT *
-FROM gold_realtime.vw_fact_xu_ly_ho_so_bi
-WHERE thoi_gian_id >= 20260701;
+-- Primary Key bảo đảm một history event chỉ có một fact.
+SELECT COUNT(*) AS rows, COUNT(DISTINCT id) AS history_ids
+FROM gold_realtime.fact_xu_ly_ho_so_stream;
 ```
 
 ## 8. Giới hạn đang được ghi nhận
@@ -265,4 +307,6 @@ WHERE thoi_gian_id >= 20260701;
 2. `dim_thoi_gian` mới có cuối tuần và ngày lễ dương cố định. KPI SLA chỉ hoàn toàn chính xác khi bổ sung lịch nghỉ Tết/hoán đổi ngày làm việc chính thức.
 3. Rework chưa có event nghiệp vụ riêng; REJECTED chỉ là proxy demo.
 4. Agency và Service được xem là bất biến sau khi hồ sơ được tạo. Nếu nghiệp vụ cho phép đổi hai thuộc tính này, cần snapshot chúng vào history hoặc xây SCD để không gán lại lịch sử theo giá trị hiện tại.
-5. Compose hiện phục vụ Spark, MinIO, Kafka, Debezium, Hive Metastore và StarRocks. Airflow/Trino/Superset chưa được khai báo service trong `docker-compose.yml`; các DAG/SQL kết nối tương ứng chỉ chạy được khi các service đó được triển khai thêm.
+5. Compose hiện phục vụ Spark, MinIO, Kafka, Debezium, Hive Metastore,
+   StarRocks và Trino. Airflow/Superset chưa được khai báo service; DAG/dashboard
+   chỉ chạy được khi triển khai thêm hai service đó.
