@@ -67,8 +67,8 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_dich_vu_cong (
 -- ---------------------------------------------------------------------------
 
 -- Fact 1: Ghi nhan thoi gian xu ly cua tung hanh dong (Transactional).
--- Fact nay duoc phuc vu realtime boi StarRocks Async MV; schema Iceberg duoi
--- day la data contract dong bo cho Trino khi can luu archive sau nay.
+-- Fact nay duoc phuc vu realtime boi Spark Structured Streaming ghi physical
+-- StarRocks fact; schema Iceberg duoi day la contract cho archive sau nay.
 -- LUU Y (phat hien khi Quan lam job transform): ma ho so nguon la CHUOI
 -- dang "HS_00001" (Application.id), khong phai so nguyen -> doi ho_so_id
 -- sang STRING de tranh phai quy uoc bo tien to/cast moi noi join voi Silver.
@@ -82,7 +82,6 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.fact_xu_ly_ho_so (
     dv_cong_id      INT,
     thoi_gian_xu_ly DOUBLE COMMENT 'Thoi gian thuc te cua buoc nay (gio)',
     tong_ngay_lam_viec_xu_ly INT COMMENT 'Chi co o event COMPLETED; dung de tinh SLA toan ho so',
-    co_bi_qua_han   INT COMMENT '1: Tre han, 0: Dung han',
     thoi_gian_id    INT COMMENT 'Partition key (yyyymmdd)'
 ) USING iceberg
 PARTITIONED BY (thoi_gian_id);

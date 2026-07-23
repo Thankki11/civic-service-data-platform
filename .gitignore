@@ -30,8 +30,7 @@ data/
 .vscode/
 .DS_Store
 Thumbs.db
+mock_database_csv
+raw
 
-# Ingestion specific ignores
-mock_database_csv/
-raw/
-nifi_extensions/
+nifi_extensions

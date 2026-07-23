@@ -1,6 +1,6 @@
 import argparse
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
@@ -18,15 +18,20 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+# Viet Nam has used the fixed UTC+07:00 offset since 1975 and has no DST.
+# Use stdlib-only timezone so the job also runs in the Python 3.8 Spark image.
+business_time_zone = timezone(timedelta(hours=7), name="Asia/Ho_Chi_Minh")
+business_today = datetime.now(business_time_zone).date()
+
 if args.snapshot_date:
     try:
         snapshot_date = date.fromisoformat(args.snapshot_date)
     except ValueError as exc:
         raise ValueError("--snapshot-date phai co dinh dang YYYY-MM-DD") from exc
 else:
-    snapshot_date = (datetime.now() - timedelta(days=1)).date()
+    snapshot_date = business_today - timedelta(days=1)
 
-if snapshot_date > date.today():
+if snapshot_date > business_today:
     raise ValueError("Khong the chot Gold cho ngay trong tuong lai.")
 
 cutoff_ts = f"{snapshot_date} 23:59:59"          # moc thoi gian chot so trong ngay

@@ -46,6 +46,11 @@ services:
       POSTGRES_DB: source_db
     volumes:
       - source_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U source_db -d source_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   # ---------- BUFFER / CDC (Layer 2) — Kiên ----------
   kafka:
@@ -61,11 +66,25 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
-  debezium:
-    image: debezium/connect:2.7
+  kafka-init:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka-init
     depends_on:
       - kafka
-      - source_db
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic postgres_server.public.Application --partitions 1 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic postgres_server.public.Application_History --partitions 1 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic postgres_server.public.Document --partitions 1 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic postgres_server.public.Applicant --partitions 1 --replication-factor 1"
+
+  debezium:
+    image: quay.io/debezium/connect:2.7
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      source_db:
+        condition: service_healthy
     ports:
       - "8083:8083"
       - "8084:8083"
@@ -75,6 +94,31 @@ services:
       CONFIG_STORAGE_TOPIC: connect_configs
       OFFSET_STORAGE_TOPIC: connect_offsets
       STATUS_STORAGE_TOPIC: connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  debezium-init:
+    image: civic-service-data-platform-python:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: debezium-init
+    command: ["python", "/opt/project/scripts/init_debezium.py"]
+    environment:
+      - DEBEZIUM_CONNECT_URL=http://debezium:8083
+      - DEBEZIUM_CONFIG_PATH=/opt/project/ingestion/debezium_config.json
+    volumes:
+      - ./:/opt/project:ro
+    depends_on:
+      debezium:
+        condition: service_healthy
 
   nifi:
     image: apache/nifi:1.27.0
@@ -121,6 +165,49 @@ services:
       - ./transform:/opt/jobs/transform
       - ./jars:/opt/spark/extra-jars
 
+  spark-fact-stream:
+    build:
+      context: .
+      dockerfile: DockerFile
+    image: apache_spark:3.5.1
+    container_name: spark-fact-stream
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - spark://spark-master:7077
+      - --jars
+      - /opt/spark/jars/starrocks-spark-connector-3.5_2.12-1.1.2.jar
+      - /opt/spark-data/transform/spark-streaming/kafka_to_starrocks_fact.py
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - APPLICATION_TOPIC=postgres_server.public.Application
+      - HISTORY_TOPIC=postgres_server.public.Application_History
+      - STARTING_OFFSETS=earliest
+      - CHECKPOINT_LOCATION=s3a://lakehouse/checkpoints/fact_xu_ly_ho_so_primary_v5_business_join
+      - STARROCKS_FE_HTTP_URL=starrocks:8030
+      - STARROCKS_FE_JDBC_URL=jdbc:mysql://starrocks:9030
+      - STARROCKS_TABLE=gold_realtime.fact_xu_ly_ho_so_stream
+      - STARROCKS_USER=root
+      - STARROCKS_PASSWORD=
+      - SPARK_CORES_MAX=2
+      - SPARK_EXECUTOR_CORES=2
+      - SPARK_EXECUTOR_MEMORY=1g
+      - SPARK_SHUFFLE_PARTITIONS=2
+    volumes:
+      - .:/opt/spark-data
+    depends_on:
+      spark-master:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+      debezium-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      starrocks-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
   # ---------- CATALOG (Layer 3) — Quân ----------
   metastore-db:
     image: postgres:16
@@ -151,6 +238,16 @@ services:
       - "8040:8040" # BE
     volumes:
       - starrocks_data:/data/deploy/starrocks
+
+  starrocks-init:
+    image: mysql:8.0
+    container_name: starrocks-init
+    entrypoint: ["/bin/sh", "/opt/project/scripts/init_starrocks.sh"]
+    volumes:
+      - ./:/opt/project:ro
+    depends_on:
+      starrocks:
+        condition: service_started
 
   # ---------- QUERY ENGINE (Layer 4) — Trung ----------
   trino:
@@ -281,8 +378,10 @@ services:
       - DB_HOST=source_db
       - DB_PORT=5432
     depends_on:
-      - source_db
-      - kafka
+      source_db:
+        condition: service_healthy
+      debezium-init:
+        condition: service_completed_successfully
 
   data-master-gen:
     build:

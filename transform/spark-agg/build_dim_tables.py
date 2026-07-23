@@ -1,16 +1,18 @@
 # GHI RA 2 NOI trong CUNG 1 lan chay
 #   (1) lakehouse.gold.dim_* (Iceberg, qua Hive Metastore) - de Trino truy van.
-#   (2) StarRocks gold_realtime.dim_* (qua JDBC/MySQL protocol) - de bang
-#       Materialized View fact_xu_ly_ho_so (real-time) JOIN vao lay
-#       thoi_han_tra_kq, ten co quan... Cac bang dim ben StarRocks dung
+#   (2) StarRocks gold_realtime.dim_* (qua JDBC/MySQL protocol) - ban sao
+#       current-state nho, san sang cho truy van ket hop voi realtime fact.
+#       Cac bang dim ben StarRocks dung
 #       PRIMARY KEY model nen INSERT lai (mode=append qua JDBC) se TU DONG
 #       UPSERT (REPLACE) theo khoa chinh, khong tao du lieu trung khi chay
 #       lai job nhieu lan.
 #
 # YEU CAU TRUOC KHI CHAY LAN DAU
-#   Da chay transform/starrocks/ddl_realtime.sql (tao database gold_realtime va cac bang dim/ods/MV ben StarRocks) va da co bang lakehouse.gold.dim_*
+#   Da chay transform/starrocks/ddl_realtime.sql va co cac bang Silver nguon.
 # ============================================================================
 
+import os
+from datetime import date, datetime, timedelta, timezone
 from functools import reduce
 
 from pyspark.sql import SparkSession, Window
@@ -57,7 +59,7 @@ spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.gold")
 
 
 def save_dim(df, table_name, key_cols):
-    """Ghi 1 dim vao ca Iceberg gold (Trino) va StarRocks gold_realtime (MV realtime)."""
+    """Ghi dimension vao Iceberg Gold va StarRocks current-state mirror."""
     full_name = f"{CATALOG}.gold.{table_name}"
     schema_sql = ", ".join(f"`{f.name}` {f.dataType.simpleString()}" for f in df.schema.fields)
     spark.sql(f"""
@@ -193,7 +195,7 @@ def save_dim_scd2(df, table_name, business_key, tracked_columns):
 
     target = spark.table(full_name)
     # Lan dau chuyen tu Type 1 sang Type 2 khong co moc thay doi lich su. Dat
-    # version baseline tu dau calendar demo de fact 2023-2028 join duoc; cac
+    # version baseline tu dau lich su demo de fact tu 2023 join duoc; cac
     # thay doi phat hien o snapshot sau dung source_snapshot_at thuc te.
     is_initial_scd_load = target.filter(F.col("effective_from_ts").isNotNull()).limit(1).count() == 0
     if is_initial_scd_load:
@@ -289,40 +291,104 @@ def save_dim_scd2(df, table_name, business_key, tracked_columns):
 #    co_phai_la_ngay_nghi = Thu 7/CN HOAC nam trong danh sach ngay le co dinh
 # ---------------------------------------------------------------------------
 FIXED_HOLIDAYS_MMDD = {"01-01", "04-30", "05-01", "09-02"}  
-
-date_spine = (
-    # Pham vi demo: du de bao phu du lieu mau va dashboard gan hien tai,
-    # nhung khong tao dimension xa hon nhu mot he thong production.
-    spark.sql("SELECT explode(sequence(to_date('2023-01-01'), to_date('2028-12-31'), interval 1 day)) AS ngay_dt")
-    .withColumn("thoi_gian_id", F.date_format("ngay_dt", "yyyyMMdd").cast("int"))
-    .withColumn("ngay", F.dayofmonth("ngay_dt"))
-    .withColumn("thang", F.month("ngay_dt"))
-    .withColumn("quy", F.quarter("ngay_dt"))
-    .withColumn("nam", F.year("ngay_dt"))
-    .withColumn("thu_trong_tuan", F.dayofweek("ngay_dt"))  # 1=CN, 7=Thu7 (Spark convention)
-    .withColumn("mmdd", F.date_format("ngay_dt", "MM-dd"))
-    .withColumn(
-        "co_phai_la_ngay_nghi",
-        (F.col("thu_trong_tuan").isin(1, 7)) | (F.col("mmdd").isin(*FIXED_HOLIDAYS_MMDD)),
-    )
-    .withColumn(
-        "stt_ngay_lam_viec",
-        F.sum(F.when(~F.col("co_phai_la_ngay_nghi"), F.lit(1)).otherwise(F.lit(0))).over(
-            Window.orderBy("ngay_dt").rowsBetween(Window.unboundedPreceding, Window.currentRow)
-        ),
-    )
-    .select(
-        "thoi_gian_id",
-        F.col("ngay_dt").alias("ngay_date"),
-        "ngay",
-        "thang",
-        "quy",
-        "nam",
-        "co_phai_la_ngay_nghi",
-        "stt_ngay_lam_viec",
-    )
+CALENDAR_START_DATE = date.fromisoformat(
+    os.getenv("CALENDAR_START_DATE", "2023-01-01")
 )
-save_dim(date_spine, "dim_thoi_gian", ["thoi_gian_id"])
+CALENDAR_DAYS_AHEAD = int(os.getenv("CALENDAR_DAYS_AHEAD", "7"))
+if CALENDAR_DAYS_AHEAD < 0:
+    raise ValueError("CALENDAR_DAYS_AHEAD phai >= 0")
+
+business_today = datetime.now(timezone(timedelta(hours=7))).date()
+calendar_end_date = business_today + timedelta(days=CALENDAR_DAYS_AHEAD)
+calendar_table = f"{CATALOG}.gold.dim_thoi_gian"
+calendar_start_date = CALENDAR_START_DATE
+base_workday_index = 0
+
+if spark.catalog.tableExists(calendar_table):
+    existing_calendar = spark.table(calendar_table)
+    calendar_stats = existing_calendar.agg(
+        F.max("ngay_date").alias("max_date"),
+        F.max("stt_ngay_lam_viec").alias("max_workday_index"),
+    ).first()
+    if calendar_stats["max_date"] is not None:
+        calendar_start_date = calendar_stats["max_date"] + timedelta(days=1)
+        base_workday_index = int(calendar_stats["max_workday_index"] or 0)
+
+    # Neu phien ban demo cu da sinh xa den 2028, cat phan tuong lai vuot
+    # horizon. Lich su tu 2023 van duoc giu de backfill va join fact cu.
+    end_time_id = int(calendar_end_date.strftime("%Y%m%d"))
+    if calendar_stats["max_date"] and calendar_stats["max_date"] > calendar_end_date:
+        spark.sql(
+            f"DELETE FROM {calendar_table} WHERE thoi_gian_id > {end_time_id}"
+        )
+        connection = spark._jvm.java.sql.DriverManager.getConnection(
+            STARROCKS_JDBC_URL, STARROCKS_USER, STARROCKS_PASSWORD
+        )
+        try:
+            statement = connection.createStatement()
+            try:
+                statement.executeUpdate(
+                    f"DELETE FROM dim_thoi_gian WHERE thoi_gian_id > {end_time_id}"
+                )
+            finally:
+                statement.close()
+        finally:
+            connection.close()
+        calendar_start_date = calendar_end_date + timedelta(days=1)
+        print(
+            f"[+] dim_thoi_gian: da cat cac ngay sau {calendar_end_date} "
+            f"(horizon {CALENDAR_DAYS_AHEAD} ngay)."
+        )
+
+if calendar_start_date <= calendar_end_date:
+    date_spine = (
+        spark.sql(
+            "SELECT explode(sequence("
+            f"to_date('{calendar_start_date}'), "
+            f"to_date('{calendar_end_date}'), interval 1 day)) AS ngay_dt"
+        )
+        .withColumn("thoi_gian_id", F.date_format("ngay_dt", "yyyyMMdd").cast("int"))
+        .withColumn("ngay", F.dayofmonth("ngay_dt"))
+        .withColumn("thang", F.month("ngay_dt"))
+        .withColumn("quy", F.quarter("ngay_dt"))
+        .withColumn("nam", F.year("ngay_dt"))
+        .withColumn("thu_trong_tuan", F.dayofweek("ngay_dt"))  # 1=CN, 7=Thu7
+        .withColumn("mmdd", F.date_format("ngay_dt", "MM-dd"))
+        .withColumn(
+            "co_phai_la_ngay_nghi",
+            (F.col("thu_trong_tuan").isin(1, 7))
+            | (F.col("mmdd").isin(*FIXED_HOLIDAYS_MMDD)),
+        )
+        .withColumn(
+            "stt_ngay_lam_viec",
+            F.lit(base_workday_index)
+            + F.sum(
+                F.when(~F.col("co_phai_la_ngay_nghi"), F.lit(1)).otherwise(F.lit(0))
+            ).over(
+                Window.orderBy("ngay_dt").rowsBetween(
+                    Window.unboundedPreceding, Window.currentRow
+                )
+            ),
+        )
+        .select(
+            "thoi_gian_id",
+            F.col("ngay_dt").alias("ngay_date"),
+            "ngay",
+            "thang",
+            "quy",
+            "nam",
+            "co_phai_la_ngay_nghi",
+            "stt_ngay_lam_viec",
+        )
+    )
+    save_dim(date_spine, "dim_thoi_gian", ["thoi_gian_id"])
+    print(
+        f"[+] dim_thoi_gian: bo sung {calendar_start_date} -> {calendar_end_date}."
+    )
+else:
+    print(
+        f"[=] dim_thoi_gian da du den {calendar_end_date}; khong ghi lai du lieu cu."
+    )
 
 
 # ---------------------------------------------------------------------------
