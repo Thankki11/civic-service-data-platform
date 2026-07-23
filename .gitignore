@@ -31,5 +31,6 @@ data/
 Thumbs.db
 mock_database_csv
 raw
+tests
 
 nifi_extensions
