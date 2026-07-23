@@ -97,6 +97,9 @@ services:
       CONFIG_STORAGE_REPLICATION_FACTOR: 1
       OFFSET_STORAGE_REPLICATION_FACTOR: 1
       STATUS_STORAGE_REPLICATION_FACTOR: 1
+      JAVA_TOOL_OPTIONS: "-javaagent:/kafka/etc/jmx_exporter/jmx_prometheus_javaagent-0.20.0.jar=9999:/kafka/etc/jmx_exporter/debezium_jmx_config.yml"
+    volumes:
+      - ./monitoring/jmx_exporter:/kafka/etc/jmx_exporter
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors >/dev/null"]
       interval: 5s
@@ -409,6 +412,31 @@ services:
       - PYTHONIOENCODING=utf-8
     depends_on:
       - minio
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - debezium
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
 
 volumes:
   minio-data:

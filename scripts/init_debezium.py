@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-CONNECT_URL = os.getenv("DEBEZIUM_CONNECT_URL", "http://debezium-connect:8083")
+CONNECT_URL = os.getenv("DEBEZIUM_CONNECT_URL", "http://debezium:8083")
 CONFIG_PATH = Path(
     os.getenv("DEBEZIUM_CONFIG_PATH", "/opt/project/ingestion/debezium_config.json")
 )
