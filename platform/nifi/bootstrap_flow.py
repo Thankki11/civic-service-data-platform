@@ -4,12 +4,9 @@ Bootstrap flow NiFi "api_ingestion" qua REST API (thay cho import tay tren UI).
 Flow: InvokeHTTP (GET http://mock-api:5000/api/payments/recent)
       -> PutS3Object (ghi landing-zone/api_payments_${now}.json tren MinIO)
 
-Chay MOT LAN sau khi NiFi khoe:
-    python platform/nifi/bootstrap_flow.py
-
-Ket qua: in ra PROCESS_GROUP_ID. Dat vao Airflow Variable `nifi_api_pg_id`
-de NifiOperator trigger:
-    airflow variables set nifi_api_pg_id <id>
+Docker Compose chay script nay bang service `nifi-init` sau khi NiFi khoe.
+Script idempotent: neu process group `api_ingestion` da ton tai thi tai su dung.
+NifiOperator tim process group theo ten nen khong can gan ID dong vao Airflow.
 
 Bien moi truong (mac dinh doc tu .env qua compose):
     NIFI_BASE_URL   mac dinh https://localhost:8443
@@ -67,6 +64,18 @@ def _create_pg(parent: str, name: str) -> str:
     )
     r.raise_for_status()
     return r.json()["id"]
+
+
+def _find_child_pg(parent: str, name: str) -> str | None:
+    """Tra ve process-group da co de bootstrap co the chay lai an toan."""
+    r = _S.get(f"{BASE}/nifi-api/flow/process-groups/{parent}", timeout=30)
+    r.raise_for_status()
+    groups = r.json()["processGroupFlow"].get("flow", {}).get("processGroups", [])
+    for entity in groups:
+        component = entity.get("component", {})
+        if component.get("name") == name:
+            return component.get("id") or entity.get("id")
+    return None
 
 
 def _add_processor(
@@ -127,6 +136,11 @@ def _connect(pg: str, src: dict, dst: dict, rels: list[str]) -> None:
 def main() -> None:
     _token()
     root = _root_pg_id()
+    existing = _find_child_pg(root, "api_ingestion")
+    if existing:
+        print(existing)
+        return
+
     pg = _create_pg(root, "api_ingestion")
 
     invoke = _add_processor(

@@ -72,6 +72,33 @@ class NifiHook(BaseHook):
     def stop_process_group(self, pg_id: str) -> None:
         self._set_state(pg_id, "STOPPED")
 
+    def find_process_group_id(self, name: str) -> str:
+        """Tim process group theo ten, bat dau tu root flow."""
+        self._connect()
+        pending = ["root"]
+        while pending:
+            parent = pending.pop(0)
+            resp = requests.get(
+                f"{self._base}/nifi-api/flow/process-groups/{parent}",
+                headers=self._headers(),
+                verify=self._verify,
+                timeout=_TIMEOUT,
+            )
+            resp.raise_for_status()
+            groups = (
+                resp.json()["processGroupFlow"]
+                .get("flow", {})
+                .get("processGroups", [])
+            )
+            for entity in groups:
+                component = entity.get("component", {})
+                pg_id = component.get("id") or entity.get("id")
+                if component.get("name") == name:
+                    return pg_id
+                if pg_id:
+                    pending.append(pg_id)
+        raise ValueError(f"Khong tim thay NiFi process group ten '{name}'")
+
     def queued_count(self, pg_id: str) -> int:
         """So flowfile con dang xep hang (recursive) trong process group."""
         self._connect()

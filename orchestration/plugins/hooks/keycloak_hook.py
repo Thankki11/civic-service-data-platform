@@ -18,7 +18,9 @@ import requests
 from airflow.hooks.base import BaseHook
 
 DEFAULT_CONN_ID = "keycloak_default"
-_TIMEOUT = 15
+# Lan xin token dau tien sau khi Keycloak dev-mode khoi dong co the mat
+# 20-30 giay de khoi tao password hashing/cache tren may local tai cao.
+_TIMEOUT = 60
 # Xin token moi som hon han thuc te de tranh dung ngay bien gioi het han
 _EXPIRY_SKEW = 30
 

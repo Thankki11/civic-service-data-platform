@@ -1,3 +1,5 @@
+import os
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import current_timestamp, input_file_name, col, explode, udf
 from pyspark.sql.types import ArrayType, StructType, StructField, StringType, BooleanType
@@ -7,12 +9,14 @@ MINIO_ACCESS_KEY = "minio_access_key"
 MINIO_SECRET_KEY = "minio_secret_key"
 ICEBERG_WAREHOUSE = "s3a://lakehouse/warehouse/"
 # Pattern đệ quy: đọc tất cả các file .xml trong các thư mục con theo cấu trúc ngày tháng
-LANDING_ZONE_PATH = "s3a://landing-zone/raw/xml/*/*/*/*/*/*.xml"
+LANDING_ZONE_PATH = os.getenv(
+    "LANDING_ZONE_PATH",
+    "s3a://landing-zone/raw/xml/*/*/*/*/*.xml",
+)
 
 
 spark = SparkSession.builder \
     .appName("Bronze_Ingestion_Job2_TransactionalXML") \
-    .config("spark.jars.packages", "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.1,org.apache.hadoop:hadoop-aws:3.3.4") \
     .config("spark.hadoop.fs.s3a.endpoint", MINIO_ENDPOINT) \
     .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY) \
     .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY) \

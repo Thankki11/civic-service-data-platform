@@ -15,12 +15,10 @@ Operator custom (orchestration/plugins):
   - NifiOperator: trigger + poll process group NiFi (nhanh API/JSON).
 
 Nhanh CDC (job3 streaming) KHONG nam trong DAG batch nay — chay nhu service
-always-on rieng (xem docker-compose service `cdc-streaming`).
+always-on rieng (xem docker-compose service `spark-cdc-bronze`).
 
 Variables:
   ingestion_force_fail = "true"  -> ep verify FAIL de test alert (Test 2.3)
-  nifi_api_pg_id                 -> id process group NiFi (xem platform/nifi)
-
 Connections (khai bao qua env trong docker-compose):
   spark_default, keycloak_default, nifi_default
 Nguoi phu trach: Thanh (Layer 6)
@@ -89,6 +87,7 @@ with DAG(
         # roi sync len landing bang boto3.
         bash_command=(
             "rm -rf /tmp/xmlgen && mkdir -p /tmp/xmlgen && cd /tmp/xmlgen && "
+            f"MINIO_ENDPOINT=http://minio:9000 "
             f"python {REPO}/data-generator/data_Transactional.py && "
             f"SOURCE_DIR=raw/xml MINIO_ENDPOINT=http://minio:9000 "
             f"python {REPO}/ingestion/sync_xml_to_landing.py"
@@ -103,7 +102,7 @@ with DAG(
     # --- Nhanh API/JSON: NiFi keo tu mock-api -> landing, roi Spark parse ---
     nifi_fetch_api = NifiOperator(
         task_id="nifi_fetch_api",
-        process_group_id="{{ var.value.nifi_api_pg_id }}",
+        process_group_name="api_ingestion",
         wait_for_completion=True,
     )
     spark_job4_api = CustomSparkSubmitOperator(

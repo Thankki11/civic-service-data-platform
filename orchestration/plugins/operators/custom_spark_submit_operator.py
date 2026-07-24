@@ -5,7 +5,7 @@ CustomSparkSubmitOperator — mo rong SparkSubmitOperator chuan de:
   2. Lay MA PySpark tu pipeline-version API theo (pipeline_name, version)
      thay vi tro toi 1 file .py cung.
   3. Tu sinh bien moi truong catalog (S3/Iceberg) tu spark_conf ma API tra ve,
-     dong thoi map spark_conf -> --conf va packages -> --packages.
+     dong thoi map spark_conf -> --conf, jars -> --jars va packages -> --packages.
   4. Goi super().execute() de spark-submit toi spark_default.
 
 Vi du:
@@ -102,7 +102,14 @@ class CustomSparkSubmitOperator(SparkSubmitOperator):
         merged_conf.update(cfg.get("spark_conf", {}))
         self._set_attr("conf", merged_conf)
 
-        # 3) packages -> --packages (chuoi phan cach dau phay)
+        # 3) JAR da bake trong image Airflow -> --jars. `packages` van duoc
+        # ho tro de registry cu tuong thich nguoc, nhung pipeline hien tai
+        # khong can tai Maven trong luc chay.
+        jars = cfg.get("jars", [])
+        if jars:
+            self._set_attr("jars", ",".join(jars))
+
+        # packages -> --packages (chuoi phan cach dau phay)
         packages = cfg.get("packages", [])
         if packages:
             self._set_attr("packages", ",".join(packages))
@@ -114,10 +121,11 @@ class CustomSparkSubmitOperator(SparkSubmitOperator):
             self._set_attr("env_vars", merged_env)
 
         self.log.info(
-            "CustomSparkSubmit: chay %s@%s (%d conf, %d packages)",
+            "CustomSparkSubmit: chay %s@%s (%d conf, %d jars, %d packages)",
             name,
             cfg.get("version", ver),
             len(merged_conf),
+            len(jars),
             len(packages),
         )
         return super().execute(context)

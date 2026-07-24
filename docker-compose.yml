@@ -65,12 +65,19 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
 
   kafka-init:
     image: confluentinc/cp-kafka:7.4.0
     container_name: kafka-init
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     entrypoint: ["/bin/bash", "-c"]
     command: >
       "kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic postgres_server.public.Application --partitions 1 --replication-factor 1 &&
@@ -87,7 +94,6 @@ services:
         condition: service_healthy
     ports:
       - "8083:8083"
-      - "8084:8083"
     environment:
       BOOTSTRAP_SERVERS: kafka:9092
       GROUP_ID: cdc-group
@@ -97,7 +103,6 @@ services:
       CONFIG_STORAGE_REPLICATION_FACTOR: 1
       OFFSET_STORAGE_REPLICATION_FACTOR: 1
       STATUS_STORAGE_REPLICATION_FACTOR: 1
-      JAVA_TOOL_OPTIONS: "-javaagent:/kafka/etc/jmx_exporter/jmx_prometheus_javaagent-0.20.0.jar=9999:/kafka/etc/jmx_exporter/debezium_jmx_config.yml"
     volumes:
       - ./monitoring/jmx_exporter:/kafka/etc/jmx_exporter
     healthcheck:
@@ -112,6 +117,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.python
+    pull_policy: build
     container_name: debezium-init
     command: ["python", "/opt/project/scripts/init_debezium.py"]
     environment:
@@ -130,11 +136,44 @@ services:
     environment:
       SINGLE_USER_CREDENTIALS_USERNAME: ${NIFI_USER}
       SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_PASSWORD}
-      NIFI_JVM_HEAP_INIT: 1g
-      NIFI_JVM_HEAP_MAX: 2g
+      # Flow demo nho; 512m/1g du dung va tranh ep Airflow/Trino bi OOM.
+      NIFI_JVM_HEAP_INIT: 512m
+      NIFI_JVM_HEAP_MAX: 1g
       NIFI_WEB_PROXY_HOST: "nifi:8443,nifi,localhost:8443,localhost"
     volumes:
       - ./ingestion/nifi:/opt/nifi/templates
+    healthcheck:
+      test: ["CMD-SHELL", "curl -kfsS https://$${HOSTNAME}:8443/nifi-api/access/config >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # Lan dau NiFi phai giai nen va nap hon 100 NAR, co the mat 8-10 phut.
+      start_period: 12m
+
+  nifi-init:
+    image: civic-service-data-platform-python:latest
+    # Image noi bo duoc build boi debezium-init trong cung lenh compose.
+    # Khong thu pull tag nay tu Docker Hub khi may vua xoa sach image.
+    pull_policy: never
+    container_name: nifi-init
+    command: ["python", "/opt/project/platform/nifi/bootstrap_flow.py"]
+    environment:
+      NIFI_BASE_URL: https://nifi:8443
+      NIFI_USER: ${NIFI_USER}
+      NIFI_PASSWORD: ${NIFI_PASSWORD}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minio_access_key
+      MINIO_SECRET_KEY: minio_secret_key
+      MOCK_API_URL: http://mock-api:5000/api/payments/recent
+    volumes:
+      - ./:/opt/project:ro
+    depends_on:
+      nifi:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      mock-api:
+        condition: service_started
 
   # ---------- COMPUTE (Layer 3/4) — Kiên + Quân ----------
   spark-master:
@@ -142,6 +181,7 @@ services:
       context: .
       dockerfile: DockerFile
     image: apache_spark:3.5.1
+    pull_policy: build
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     ports:
       - "8081:8080" # Spark Master UI
@@ -156,30 +196,61 @@ services:
 
   spark-worker:
     image: apache_spark:3.5.1
+    # Image noi bo duoc build boi spark-master trong cung lenh compose.
+    pull_policy: never
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     depends_on: [spark-master]
     environment:
       SPARK_NO_DAEMONIZE: "true"
-      SPARK_WORKER_MEMORY: 2g
-      SPARK_WORKER_CORES: 2
+      # 1 core CDC->Bronze + 1 core realtime fact + 1 core con lai cho batch.
+      SPARK_WORKER_MEMORY: 3g
+      SPARK_WORKER_CORES: 3
     volumes:
       - .:/opt/spark-data
       - ./ingestion/spark-batch:/opt/jobs/ingestion
       - ./transform:/opt/jobs/transform
       - ./jars:/opt/spark/extra-jars
 
-  spark-fact-stream:
-    build:
-      context: .
-      dockerfile: DockerFile
+  spark-cdc-bronze:
     image: apache_spark:3.5.1
+    pull_policy: never
+    container_name: spark-cdc-bronze
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - spark://spark-master:7077
+      - /opt/spark-data/ingestion/streaming-kafka/job3_streaming_cdc.py
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - SPARK_CORES_MAX=1
+      - SPARK_EXECUTOR_CORES=1
+      - SPARK_EXECUTOR_MEMORY=1g
+      - SPARK_SHUFFLE_PARTITIONS=2
+    volumes:
+      - .:/opt/spark-data
+    depends_on:
+      spark-master:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+      debezium-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      hive-metastore:
+        condition: service_started
+    restart: unless-stopped
+
+  spark-fact-stream:
+    image: apache_spark:3.5.1
+    pull_policy: never
     container_name: spark-fact-stream
     command:
       - /opt/spark/bin/spark-submit
       - --master
       - spark://spark-master:7077
       - --jars
-      - /opt/spark/jars/starrocks-spark-connector-3.5_2.12-1.1.2.jar
+      - local:///opt/spark/jars/starrocks-spark-connector-3.5_2.12-1.1.2.jar
       - /opt/spark-data/transform/spark-streaming/kafka_to_starrocks_fact.py
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -187,13 +258,15 @@ services:
       - HISTORY_TOPIC=postgres_server.public.Application_History
       - STARTING_OFFSETS=earliest
       - CHECKPOINT_LOCATION=s3a://lakehouse/checkpoints/fact_xu_ly_ho_so_primary_v5_business_join
-      - STARROCKS_FE_HTTP_URL=starrocks:8030
+      # Connector Stream Load phai di qua proxy 8080 cua image all-in-one.
+      # 8030 la FE HTTP truc tiep va se redirect ve BE 127.0.0.1:8040.
+      - STARROCKS_FE_HTTP_URL=starrocks:8080
       - STARROCKS_FE_JDBC_URL=jdbc:mysql://starrocks:9030
       - STARROCKS_TABLE=gold_realtime.fact_xu_ly_ho_so_stream
       - STARROCKS_USER=root
       - STARROCKS_PASSWORD=
-      - SPARK_CORES_MAX=2
-      - SPARK_EXECUTOR_CORES=2
+      - SPARK_CORES_MAX=1
+      - SPARK_EXECUTOR_CORES=1
       - SPARK_EXECUTOR_MEMORY=1g
       - SPARK_SHUFFLE_PARTITIONS=2
     volumes:
@@ -222,7 +295,20 @@ services:
       - metastore-db-data:/var/lib/postgresql/data
 
   hive-metastore:
-    image: apache/hive:4.0.0
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM apache/hive:4.0.0
+        USER root
+        RUN apt-get update \
+            && apt-get install -y --no-install-recommends ca-certificates curl \
+            && rm -rf /var/lib/apt/lists/* \
+            && curl -fsSL https://repo1.maven.org/maven2/org/postgresql/postgresql/42.6.0/postgresql-42.6.0.jar -o /opt/hive/lib/postgresql.jar \
+            && curl -fsSL https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar -o /opt/hive/lib/hadoop-aws.jar \
+            && curl -fsSL https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar -o /opt/hive/lib/aws-java-sdk-bundle.jar
+        COPY _hivejars/core-site.xml /opt/hadoop/etc/hadoop/core-site.xml
+        USER hive
+    image: civic-service-data-platform-hive:4.0.0
     depends_on: [metastore-db, minio]
     ports:
       - "9083:9083"
@@ -240,7 +326,16 @@ services:
       - "9030:9030" # FE MySQL protocol
       - "8040:8040" # BE
     volumes:
-      - starrocks_data:/data/deploy/starrocks
+      # Khong mount de len /data/deploy/starrocks: se che mat binary/config.
+      - starrocks_fe_meta:/data/deploy/starrocks/fe/meta
+      - starrocks_be_storage:/data/deploy/starrocks/be/storage
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -P 9030 -u root --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      # Cold start phai khoi tao FE/BE va replay journal truoc khi mo cong 9030.
+      start_period: 10m
 
   starrocks-init:
     image: mysql:8.0
@@ -250,25 +345,76 @@ services:
       - ./:/opt/project:ro
     depends_on:
       starrocks:
-        condition: service_started
+        condition: service_healthy
 
   # ---------- QUERY ENGINE (Layer 4) — Trung ----------
   trino:
     image: trinodb/trino:453
     depends_on: [hive-metastore, minio]
+    # Gioi han cho local demo: image mac dinh cap toi 80% RAM Docker cho JVM,
+    # de gay OOM khi Spark, Kafka, StarRocks va Superset cung chay.
+    mem_limit: 3g
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xms512m -Xmx2g"
     ports:
       - "8082:8080"
     volumes:
       - ./transform/metastore/trino-catalog:/etc/trino/catalog
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/lib/trino/bin/health-check"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      # Trino cold start nap toan bo plugin; mac dinh cua image chi cho 10 giay.
+      start_period: 10m
+    restart: unless-stopped
 
   # ---------- PRESENTATION (Layer 5) — Trung ----------
   superset:
-    image: apache/superset:4.0.2
-    depends_on: [trino, starrocks]
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM apache/superset:4.0.2
+        USER root
+        RUN pip install --no-cache-dir "apache-superset[trino]==4.0.2" "trino==0.338.0" "PyMySQL==1.1.1"
+        # Airflow va Superset cung o localhost; cookie khong phan biet port.
+        # Dung ten rieng de Superset khong ghi de cookie CSRF cua Airflow.
+        RUN printf "SESSION_COOKIE_NAME = 'superset_session'\n" > /app/superset_config.py
+        ENV SUPERSET_CONFIG_PATH=/app/superset_config.py
+        USER superset
+    image: civic-service-data-platform-superset:4.0.2
+    depends_on:
+      trino:
+        condition: service_healthy
+      starrocks-init:
+        condition: service_completed_successfully
     ports:
       - "8088:8088"
     environment:
       SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME:-admin}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin}
+    volumes:
+      - superset-home:/app/superset_home
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        superset db upgrade &&
+        (superset fab create-admin
+        --username "$${SUPERSET_ADMIN_USERNAME}"
+        --firstname Demo
+        --lastname Admin
+        --email admin@example.com
+        --password "$${SUPERSET_ADMIN_PASSWORD}" || true) &&
+        superset init &&
+        exec /usr/bin/run-server.sh
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8088/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
 
   # ---------- ORCHESTRATION (Layer 6) — Thành ----------
   airflow-db:
@@ -279,24 +425,46 @@ services:
       POSTGRES_DB: airflow
     volumes:
       - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   airflow:
     build:
       context: .
       dockerfile: orchestration/airflow.Dockerfile
-    depends_on: [airflow-db]
+    depends_on:
+      airflow-db:
+        condition: service_healthy
     ports:
       - "8080:8080"
     environment:
+      # Official Airflow image entrypoint: migrate metadata DB and create a
+      # deterministic local-demo admin on a brand-new airflow-db volume.
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USERNAME:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+      _AIRFLOW_WWW_USER_FIRSTNAME: Demo
+      _AIRFLOW_WWW_USER_LASTNAME: Admin
+      _AIRFLOW_WWW_USER_EMAIL: admin@example.com
+      _AIRFLOW_WWW_USER_ROLE: Admin
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@airflow-db/airflow
+      # Giu Flask session/CSRF hop le qua cac lan recreate container.
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY:-local_demo_airflow_webserver_secret_key_change_me}
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "600"
       AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: "300"
-      AIRFLOW__WEBSERVER__WORKERS: "2"
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+      AIRFLOW__SCHEDULER__PARSING_PROCESSES: "1"
+      AIRFLOW__CORE__PARALLELISM: "4"
       AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type":"spark","host":"spark://spark-master","port":7077}'
       AIRFLOW_CONN_KEYCLOAK_DEFAULT: '{"conn_type":"http","host":"http://keycloak:8080","login":"${KEYCLOAK_ROPC_USER}","password":"${KEYCLOAK_ROPC_PASSWORD}","extra":{"realm":"lakehouse","client_id":"${KEYCLOAK_CLIENT_ID}","client_secret":"${KEYCLOAK_CLIENT_SECRET}"}}'
       AIRFLOW_CONN_NIFI_DEFAULT: '{"conn_type":"http","host":"https://nifi:8443","login":"${NIFI_USER}","password":"${NIFI_PASSWORD}","extra":{"verify_ssl":false}}'
+      AIRFLOW_CONN_TRINO_DEFAULT: '{"conn_type":"trino","host":"trino","port":8080,"login":"airflow","schema":"gold","extra":{"catalog":"iceberg"}}'
       AIRFLOW_VAR_PIPELINE_API_BASE: "http://pipeline-api:8000"
       PYSPARK_PYTHON: "/usr/local/bin/python3.12"
       PYSPARK_DRIVER_PYTHON: "python3"
@@ -304,11 +472,20 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
     volumes:
-      - ./orchestration/dags:/opt/airflow/dags
-      - ./orchestration/plugins:/opt/airflow/plugins
-      - ./orchestration/alerts:/opt/airflow/alerts
-      - .:/opt/airflow/repo
+      - ./orchestration/dags:/opt/airflow/dags:ro
+      - ./orchestration/plugins/__init__.py:/opt/airflow/plugins/__init__.py:ro
+      - ./orchestration/plugins/hooks:/opt/airflow/plugins/hooks:ro
+      - ./orchestration/plugins/operators:/opt/airflow/plugins/operators:ro
+      - ./orchestration/alerts:/opt/airflow/alerts:ro
+      - .:/opt/airflow/repo:ro
     command: standalone
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=5)\""]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    restart: unless-stopped
 
   # ---------- CONTROL-PLANE (Layer 6) — Thành ----------
   keycloak:
@@ -344,6 +521,7 @@ services:
   # ---------- CI/CD (Layer 7) — Thành ----------
   jenkins:
     image: jenkins/jenkins:lts
+    profiles: ["cicd"]
     user: root                         # Cần root để gọi Docker socket của host
     ports:
       - "8090:8080"
@@ -358,9 +536,8 @@ services:
 
   # ---------- MOCK DATA GENERATORS ----------
   mock-api:
-    build:
-      context: .
-      dockerfile: Dockerfile.python
+    image: civic-service-data-platform-python:latest
+    pull_policy: never
     container_name: mock-api
     ports:
       - "5000:5000"
@@ -373,6 +550,7 @@ services:
       context: .
       dockerfile: Dockerfile.python
     container_name: stream-simulator
+    profiles: ["manual"]
     command: ["python", "data_stream_simulator.py"]
     volumes:
       - ./data-generator:/app
@@ -416,6 +594,7 @@ services:
   prometheus:
     image: prom/prometheus:v2.51.0
     container_name: prometheus
+    profiles: ["monitoring"]
     ports:
       - "9090:9090"
     volumes:
@@ -426,6 +605,7 @@ services:
   grafana:
     image: grafana/grafana:10.4.0
     container_name: grafana
+    profiles: ["monitoring"]
     ports:
       - "3000:3000"
     environment:
@@ -444,4 +624,6 @@ volumes:
   airflow-db-data:
   jenkins-data:
   source_db_data:
-  starrocks_data:
+  starrocks_fe_meta:
+  starrocks_be_storage:
+  superset-home:

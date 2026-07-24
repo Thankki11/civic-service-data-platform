@@ -1,15 +1,48 @@
-# Superset Data Connections — Trung
+# Superset local demo
 
-Theo bảng action items: tách biệt dashboard **Real-time (StarRocks)** và **Batch (Trino)**.
+Ba dashboard do nhóm BI bàn giao được export từ Superset nhưng đang tham chiếu
+đến một MySQL cũ (`civic_batch` và `civic_realtime`). Không import trực tiếp ba
+file gốc nếu muốn đọc dữ liệu của pipeline này.
 
-## 1. Trino (Batch — Gold Mart)
-- SQLAlchemy URI: `trino://trino@trino:8080/iceberg`
-- Kiểm tra quyền truy cập của service account kết nối (yêu cầu trong bảng)
+## Luồng dữ liệu dùng cho BI
 
-## 2. StarRocks (Real-time)
-- StarRocks nói MySQL protocol → URI: `starrocks://root:@starrocks:9030/`
-  (hoặc `mysql://root:@starrocks:9030/` nếu chưa cài driver starrocks)
+- Batch: Superset -> Trino -> các bảng fact/dim trong `iceberg.gold`.
+- Realtime: Superset -> các bảng fact/dim trong `gold_realtime` của StarRocks.
+- Kết nối batch:
+  `trino://superset@trino:8080/iceberg`.
+- Kết nối realtime:
+  `mysql+pymysql://root@starrocks:9030/gold_realtime`.
 
-## Export dashboard
-Sau khi dựng xong: Settings → Export dashboard → commit file .zip/.yaml vào thư mục này
-để mọi người import lại được.
+Các câu join fact/dim được lưu ngay trong virtual dataset của gói dashboard,
+không tạo thêm view vật lý hay file DDL. Realtime đi thẳng vào StarRocks để
+tránh thêm một query hop qua Trino. Trino chỉ phục vụ batch Iceberg.
+
+## Gói import
+
+Ba file đã được chuyển đúng connection nằm trong `warehouse/superset/imports`:
+
+- `dashboard-cap-1-bi.zip`
+- `dashboard-cap-2-bi.zip`
+- `dashboard-cap-3-bi.zip`
+
+## Chạy và import bằng giao diện web
+
+```powershell
+docker compose up -d --build
+```
+
+Mở `http://localhost:8088`, đăng nhập bằng giá trị
+`SUPERSET_ADMIN_USERNAME`/`SUPERSET_ADMIN_PASSWORD`. Nếu chưa khai báo hai biến
+này thì tài khoản demo mặc định là `admin`/`admin`.
+
+Trong Superset, vào **Settings -> Import Dashboards**, bật **Overwrite** nếu đã
+import trước đó, rồi lần lượt tải lên ba file `*-bi.zip`.
+
+Không cần mount thư mục `Send Anywhere...` vào container khi import bằng web:
+trình duyệt tự tải ZIP lên Superset. Mount chỉ cần thiết nếu muốn tự động hóa
+import bằng CLI.
+
+Superset dùng SQLite trong named volume `superset-home` để giảm RAM cho bản demo
+local. Volume này lưu user, connection, dataset, chart và dashboard khi container
+được recreate. Khi triển khai nhiều người dùng, hãy đổi metadata database sang
+PostgreSQL.

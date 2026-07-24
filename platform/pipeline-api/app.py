@@ -10,7 +10,7 @@ Endpoints:
   GET /health                                  -> khong can auth
   GET /pipelines/{name}                         -> metadata + latest version
   GET /pipelines/{name}/versions/{ver}/code     -> source PySpark (text/plain)
-  GET /pipelines/{name}/versions/{ver}/config   -> spark_conf + packages + catalog_env
+  GET /pipelines/{name}/versions/{ver}/config   -> spark_conf + jars/packages + catalog_env
 
 Bien moi truong:
   KEYCLOAK_ISSUER   vd http://keycloak:8080/realms/lakehouse
@@ -158,6 +158,7 @@ def get_config(name: str, version: str, _claims: dict = Depends(verify_token)) -
         "pipeline": name,
         "version": resolved,
         "spark_conf": spark_conf,
+        "jars": ver.get("jars", []),
         "packages": ver.get("packages", []),
         "catalog_env": _catalog_env(spark_conf),
     }

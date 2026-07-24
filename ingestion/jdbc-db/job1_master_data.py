@@ -12,7 +12,6 @@ MASTER_SNAPSHOT_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 spark = SparkSession.builder \
     .appName("Bronze_Ingestion_Job1_MasterData") \
-    .config("spark.jars.packages", "org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.1,org.apache.hadoop:hadoop-aws:3.3.4,org.postgresql:postgresql:42.6.0") \
     .config("spark.hadoop.fs.s3a.endpoint", MINIO_ENDPOINT) \
     .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY) \
     .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY) \

@@ -31,10 +31,13 @@ pipelines:
     versions:
       "1.0.0":
         code_path: "ingestion/jdbc-db/job1_master_data.py"
-        packages:
-          - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
-          - "org.apache.hadoop:hadoop-aws:3.3.4"
-          - "org.postgresql:postgresql:42.6.0"
+        # local:// dung ban JAR da bake cung path tren driver va worker,
+        # khong upload lai AWS SDK bundle 280 MB qua Spark moi lan chay.
+        jars:
+          - "local:///opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.5.2.jar"
+          - "local:///opt/spark/jars/hadoop-aws-3.3.4.jar"
+          - "local:///opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar"
+          - "local:///opt/spark/jars/postgresql-42.6.0.jar"
         spark_conf:
           <<: *default_spark_conf
 
@@ -44,9 +47,10 @@ pipelines:
     versions:
       "1.0.0":
         code_path: "ingestion/spark-batch/job2_transactional_xml.py"
-        packages:
-          - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
-          - "org.apache.hadoop:hadoop-aws:3.3.4"
+        jars:
+          - "local:///opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.5.2.jar"
+          - "local:///opt/spark/jars/hadoop-aws-3.3.4.jar"
+          - "local:///opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar"
         spark_conf:
           <<: *default_spark_conf
 
@@ -56,25 +60,25 @@ pipelines:
     versions:
       "1.0.0":
         code_path: "ingestion/nifi/create_table.py"
-        packages:
-          - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
-          - "org.apache.hadoop:hadoop-aws:3.3.4"
+        jars:
+          - "local:///opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.5.2.jar"
+          - "local:///opt/spark/jars/hadoop-aws-3.3.4.jar"
+          - "local:///opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar"
         spark_conf:
           <<: *default_spark_conf
-          spark.cores.max: "2"
+          spark.cores.max: "1"
           spark.executor.cores: "1"
           spark.executor.memory: "1g"
-
-
   silver:
     description: "Bronze -> Silver (dedup, chuan hoa)"
     latest: "1.0.0"
     versions:
       "1.0.0":
         code_path: "transform/spark-etl/bronze_to_silver.py"
-        packages:
-          - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
-          - "org.apache.hadoop:hadoop-aws:3.3.4"
+        jars:
+          - "local:///opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.5.2.jar"
+          - "local:///opt/spark/jars/hadoop-aws-3.3.4.jar"
+          - "local:///opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar"
         spark_conf:
           <<: *default_spark_conf
 
@@ -84,9 +88,11 @@ pipelines:
     versions:
       "1.0.0":
         code_path: "transform/spark-agg/build_dim_tables.py"
-        packages:
-          - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
-          - "org.apache.hadoop:hadoop-aws:3.3.4"
+        jars:
+          - "local:///opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.5.2.jar"
+          - "local:///opt/spark/jars/hadoop-aws-3.3.4.jar"
+          - "local:///opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar"
+          - "local:///opt/spark/jars/mysql-connector-j-8.0.33.jar"
         spark_conf:
           <<: *default_spark_conf
 
@@ -97,9 +103,10 @@ pipelines:
     versions:
       "1.0.0":
         code_path: "transform/spark-agg/silver_to_gold.py"
-        packages:
-          - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2"
-          - "org.apache.hadoop:hadoop-aws:3.3.4"
+        jars:
+          - "local:///opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.5.2.jar"
+          - "local:///opt/spark/jars/hadoop-aws-3.3.4.jar"
+          - "local:///opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar"
         spark_conf:
           <<: *default_spark_conf
 

@@ -1,6 +1,14 @@
+import os
+
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, current_timestamp, to_date
+from pyspark.sql.functions import col, from_json, current_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, LongType, TimestampType
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+SPARK_CORES_MAX = os.getenv("SPARK_CORES_MAX", "1")
+SPARK_EXECUTOR_CORES = os.getenv("SPARK_EXECUTOR_CORES", "1")
+SPARK_EXECUTOR_MEMORY = os.getenv("SPARK_EXECUTOR_MEMORY", "1g")
+SPARK_SHUFFLE_PARTITIONS = os.getenv("SPARK_SHUFFLE_PARTITIONS", "2")
 
 def process_stream():
     # Khởi tạo Spark Session với các config cho Kafka, Iceberg
@@ -16,9 +24,10 @@ def process_stream():
         .config("spark.hadoop.fs.s3a.secret.key", "minio_secret_key") \
         .config("spark.hadoop.fs.s3a.path.style.access", "true") \
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-        .config("spark.cores.max", "6") \
-        .config("spark.executor.cores", "3") \
-        .config("spark.executor.memory", "2g") \
+        .config("spark.cores.max", SPARK_CORES_MAX) \
+        .config("spark.executor.cores", SPARK_EXECUTOR_CORES) \
+        .config("spark.executor.memory", SPARK_EXECUTOR_MEMORY) \
+        .config("spark.sql.shuffle.partitions", SPARK_SHUFFLE_PARTITIONS) \
         .getOrCreate()
         
     spark.sparkContext.setLogLevel("WARN")
@@ -30,7 +39,7 @@ def process_stream():
         
         df_stream = spark.readStream \
             .format("kafka") \
-            .option("kafka.bootstrap.servers", "kafka:29092") \
+            .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
             .option("subscribe", kafka_topic) \
             .option("startingOffsets", "earliest") \
             .option("failOnDataLoss", "false") \
